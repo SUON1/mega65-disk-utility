@@ -1,0 +1,23 @@
+# Build trees and CMake output
+build/
+build-*/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+compile_commands.json
+
+# macOS, diagnostics, and generated media images
+.DS_Store
+*.log
+*.d81
+*.img
+core
+core.*
+*.core
+hardware-report*.json
+hardware-report*.txt
+hardware-report*.md
+tmp-hardware-*

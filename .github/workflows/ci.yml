@@ -1,0 +1,25 @@
+name: macOS C build and mock tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-14
+    strategy:
+      matrix:
+        preset: [debug, release]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake --preset "${{ matrix.preset }}"
+      - name: Build
+        run: cmake --build --preset "${{ matrix.preset }}" --parallel
+      - name: Unit and fake-transport tests only
+        run: ctest --preset "${{ matrix.preset }}"
+        env:
+          M65_ENABLE_HARDWARE_TESTS: "OFF"

@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "command": {
+    "name": "inspect"
+  },
+  "device": {
+    "bsd_name": "diskN",
+    "usb": {
+      "vid": {
+        "numeric": 1604,
+        "hex": "0x0644"
+      },
+      "pid": {
+        "numeric": 0,
+        "hex": "0x0000"
+      },
+      "manufacturer": "TEACV0.0",
+      "product": "TEAC USB UF000x",
+      "product_revision": "0200",
+      "known_controller": true
+    }
+  },
+  "media": {
+    "present": true,
+    "external": true,
+    "removable": true,
+    "whole": true,
+    "mounted": false,
+    "capacity_bytes": 737280,
+    "block_size": 512,
+    "permissions": {
+      "raw_path": "/dev/rdiskN",
+      "readable": true,
+      "errno": 0
+    }
+  },
+  "ufi": {
+    "inquiry": {
+      "vendor": "TEAC",
+      "product": "USB UF000x",
+      "firmware": "0200"
+    },
+    "test_unit_ready": true,
+    "capacity": {
+      "blocks": 1440,
+      "block_size": 512,
+      "bytes": 737280
+    },
+    "format_capacities": [
+      {
+        "blocks": 1440,
+        "block_size": 512,
+        "descriptor_code": 2
+      }
+    ],
+    "flexible_disk": {
+      "transfer_rate_kbit_s": 250,
+      "heads": 2,
+      "sectors_per_track": 9,
+      "bytes_per_sector": 512,
+      "cylinders": 80,
+      "medium_rotation_rate_rpm": 300,
+      "changeable_fields": [
+        "sectors_per_track"
+      ]
+    },
+    "sense": {
+      "valid": false,
+      "sense_key": 0,
+      "asc": 0,
+      "ascq": 0
+    }
+  },
+  "result": {
+    "status": "ok",
+    "reason": "inspection completed"
+  },
+  "errors": []
+}
