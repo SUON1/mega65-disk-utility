@@ -12,6 +12,7 @@ void test_bytes(void);
 void test_cli(void);
 void test_device(void);
 void test_json(void);
+void test_layout(void);
 void test_probe(void);
 void test_ufi(void);
 

@@ -20,6 +20,13 @@ The probe determines whether the controller can temporarily accept the
 250 kbit/s, 80-cylinder, 10-sector geometry and read all 1,600 sectors. It
 never sends a floppy-media write command.
 
+The core library now also contains a read-only 1581 layout translator. It maps
+the 80 × 40 Commodore logical sectors of 256 bytes to the controller's
+80 × 2 × 10 physical sectors of 512 bytes and back. It includes the supplied
+fast-read interleave policy, but deliberately does not implement filesystem
+allocation or D81 directory/BAM parsing. See
+[disk-layout.md](docs/disk-layout.md).
+
 No open-source license has been selected yet. No license file is included,
 and the absence of a license means the usual default copyright restrictions
 apply.
@@ -157,8 +164,9 @@ the kernel driver or fall back to an undocumented pass-through mechanism.
   exercised with a stateful fake transport.
 - Every controller response is length-checked before decoding.
 
-See [architecture.md](docs/architecture.md) for module boundaries and
-[hardware-results.md](docs/hardware-results.md) for the current hardware
+See [architecture.md](docs/architecture.md) for module boundaries,
+[disk-layout.md](docs/disk-layout.md) for the logical/physical translation,
+and [hardware-results.md](docs/hardware-results.md) for the current hardware
 record. A sanitized valid JSON document is in
 [example-report.json](docs/example-report.json).
 

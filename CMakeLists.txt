@@ -32,6 +32,7 @@ add_library(m65core STATIC
   src/cli.c
   src/device.c
   src/json.c
+  src/layout.c
   src/probe.c
   src/ufi.c
 )
@@ -72,6 +73,7 @@ if(BUILD_TESTING)
     tests/test_cli.c
     tests/test_device.c
     tests/test_json.c
+    tests/test_layout.c
     tests/test_main.c
     tests/test_probe.c
     tests/test_ufi.c

@@ -17,6 +17,7 @@ int main(void)
     test_cli();
     test_device();
     test_json();
+    test_layout();
     test_ufi();
     test_probe();
     if (m65_test_failures != 0) {

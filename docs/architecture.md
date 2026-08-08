@@ -7,6 +7,7 @@ logic can be tested without hardware.
 |---|---|---|
 | CLI | `src/cli.c`, `src/main.c` | Strict option parsing, device selection, exit-code mapping, exclusive output-file creation |
 | UFI | `src/ufi.c` | CDB construction, allowlist enforcement, bounds-checked response parsing, Flexible Disk page handling |
+| 1581 layout | `src/layout.c` | Pure logical-sector/LBA translation, bounded sector extraction, and interleave policy |
 | Workflow | `src/probe.c` | Exclusive-access lifetime, inspect sequence, two-read 1581 sequence, restoration and interruption cleanup |
 | Transport | `include/m65/transport.h` | Backend-neutral typed command/result interface |
 | macOS transport | `src/scsi_macos.c` | Documented SCSITaskDeviceInterface and SCSITaskInterface calls |
@@ -17,6 +18,12 @@ logic can be tested without hardware.
 The CLI never handles raw SCSI response bytes. The transport returns a typed
 command result, UFI parsers produce typed structures, and report structures
 cross the workflow/output boundary.
+
+The layout module is platform-independent and has no transport or filesystem
+dependency. Its 1-based logical tracks and 0-based physical addresses make
+the convention change explicit. A sequential 1,600-block physical read and a
+canonical 3,200-sector D81 image have identical byte order; the module proves
+and tests the mapping rather than relying on that fact implicitly.
 
 ## MODE SELECT containment
 

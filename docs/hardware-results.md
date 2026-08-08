@@ -53,3 +53,25 @@ SCSITaskLib path on this macOS driver stack. Detaching or replacing the kernel
 storage driver is outside this milestone and is not attempted. Do not publish
 a transient disk number, username, or absolute output path in a shared
 hardware report.
+
+## MEGA65 internal-drive reference
+
+Photos supplied after the USB-controller test add context about the drive used
+inside a MEGA65. The photographed label identifies an **Alps Electric
+DF354N164G**, made in Malaysia; its serial number is intentionally omitted
+from this public hardware record. The accompanying spare-part listing
+describes a used 3.5-inch drive with 720 KB and 1.44 MB support, a 34-pin
+ribbon connection, and a four-pin power connection.
+
+The supplied MEGA65 manual page says the internal controller expects a Double
+Density disk. It also says an HD disk can be made to present as DD by covering
+both sides of its HD-detection hole, while noting that the drive hardware can
+read HD media. These internal-drive facts do not change the tested USB bridge
+identity or macOS's 737,280-byte report.
+
+The supplied layout notes describe 80 logical tracks with 40 × 256-byte
+sectors per track, backed by 20 × 512-byte physical sectors split ten per
+head. That mapping and the supplied interleave policy are now encoded in the
+platform-independent layout backend and documented in
+[disk-layout.md](disk-layout.md). Hardware confirmation remains pending the
+macOS transport limitation above.
