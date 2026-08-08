@@ -25,12 +25,16 @@ static void json_device_fields(M65Json *json, const M65DeviceInfo *device)
     } else {
         (void)m65_json_null(json);
     }
+    (void)m65_json_key(json, "name");
+    (void)m65_json_string(json, device != NULL ? device->media_name : "");
     (void)m65_json_key(json, "usb");
     (void)m65_json_begin_object(json);
     (void)m65_json_key(json, "vid");
     json_identifier(json, device != NULL ? device->usb_vid : 0U);
     (void)m65_json_key(json, "pid");
     json_identifier(json, device != NULL ? device->usb_pid : 0U);
+    (void)m65_json_key(json, "device_revision");
+    json_identifier(json, device != NULL ? device->usb_device_revision : 0U);
     (void)m65_json_key(json, "manufacturer");
     (void)m65_json_string(json, device != NULL ? device->usb_manufacturer : "");
     (void)m65_json_key(json, "product");
@@ -249,10 +253,12 @@ void m65_output_list_human(const M65DeviceList *list, const char *error)
         const M65DeviceInfo *device = &list->items[index];
         (void)printf(
             "%s\n"
+            "  Name: %s\n"
             "  USB: %s / %s, VID 0x%04x (%u), PID 0x%04x (%u), revision %s\n"
             "  Media: %s, %llu bytes, %u-byte blocks, %s, %s, %s, %s\n"
             "  Permissions: %s (%s)\n",
             device->bsd_name,
+            device->media_name,
             device->usb_manufacturer, device->usb_product,
             (unsigned int)device->usb_vid, (unsigned int)device->usb_vid,
             (unsigned int)device->usb_pid, (unsigned int)device->usb_pid,

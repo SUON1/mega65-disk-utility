@@ -105,6 +105,7 @@ static bool identity_matches(const M65DeviceInfo *device)
 {
     bool product_match = strstr(device->usb_product, "UF000") != NULL ||
                          strstr(device->usb_product, "TEAC") != NULL ||
+                         strstr(device->media_name, "UF000") != NULL ||
                          strstr(device->usb_manufacturer, "TEACV0.0") != NULL;
     return device->usb_vid == 0x0644U && device->usb_pid == 0x0000U && product_match;
 }
@@ -113,6 +114,7 @@ static void populate_identity(io_registry_entry_t entry, M65DeviceInfo *device)
 {
     device->usb_vid = recursive_u16(entry, kUSBVendorID);
     device->usb_pid = recursive_u16(entry, kUSBProductID);
+    device->usb_device_revision = recursive_u16(entry, "bcdDevice");
     recursive_string(entry, kUSBVendorString, device->usb_manufacturer,
                      sizeof(device->usb_manufacturer));
     recursive_string(entry, kUSBProductString, device->usb_product,
@@ -121,8 +123,8 @@ static void populate_identity(io_registry_entry_t entry, M65DeviceInfo *device)
         recursive_string(entry, kIOPropertyProductNameKey, device->usb_product,
                          sizeof(device->usb_product));
     }
-    recursive_string(entry, kIOPropertyProductRevisionLevelKey,
-                     device->product_revision, sizeof(device->product_revision));
+    (void)snprintf(device->product_revision, sizeof(device->product_revision),
+                   "0x%04x", (unsigned int)device->usb_device_revision);
     device->known_controller = identity_matches(device);
 }
 
@@ -199,6 +201,7 @@ bool m65_discover_devices(M65DeviceList *list, char *detail, size_t detail_size)
     while ((media = IOIteratorNext(iterator)) != IO_OBJECT_NULL) {
         CFTypeRef bsd_value;
         M65DeviceInfo device;
+        io_name_t media_name;
         io_string_t registry_path;
         (void)memset(&device, 0, sizeof(device));
         bsd_value = IORegistryEntryCreateCFProperty(media, CFSTR("BSD Name"),
@@ -210,6 +213,16 @@ bool m65_discover_devices(M65DeviceList *list, char *detail, size_t detail_size)
         if (device.bsd_name[0] == '\0') {
             IOObjectRelease(media);
             continue;
+        }
+        if (IORegistryEntryGetName(media, media_name) == KERN_SUCCESS) {
+            size_t name_length;
+            (void)snprintf(device.media_name, sizeof(device.media_name),
+                           "%s", media_name);
+            name_length = strlen(device.media_name);
+            if (name_length > 6U &&
+                strcmp(&device.media_name[name_length - 6U], " Media") == 0) {
+                device.media_name[name_length - 6U] = '\0';
+            }
         }
         if (IORegistryEntryGetPath(media, kIOServicePlane, registry_path) == KERN_SUCCESS) {
             (void)snprintf(device.registry_path, sizeof(device.registry_path),

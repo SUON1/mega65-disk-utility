@@ -14,11 +14,13 @@ typedef struct {
     char bsd_name[M65_MAX_BSD_NAME];
     char raw_path[M65_MAX_IDENTITY];
     char registry_path[M65_MAX_REGISTRY_PATH];
+    char media_name[M65_MAX_IDENTITY];
     char usb_manufacturer[M65_MAX_IDENTITY];
     char usb_product[M65_MAX_IDENTITY];
     char product_revision[M65_MAX_IDENTITY];
     uint16_t usb_vid;
     uint16_t usb_pid;
+    uint16_t usb_device_revision;
     bool known_controller;
     bool media_present;
     bool external;

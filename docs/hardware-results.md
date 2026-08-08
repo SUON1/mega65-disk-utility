@@ -31,18 +31,22 @@ unmounted whole raw device with:
 
 The BSD number is intentionally not recorded because it is unstable.
 
-## Probe result for this build session
+## Live probe result — 2026-08-08
 
 | Field | Result |
 |---|---|
-| Live controller/media visible during build | No |
-| Disk Arbitration available inside the build runner | No; session creation was denied/unavailable |
-| `inspect` hardware result | Not performed |
+| Live controller/media visible outside the build sandbox | Yes, dynamically discovered as `disk4` |
+| USB identity | `0x0644:0x0000`, TEACV0.0, `bcdDevice` `0x0200` |
+| Disk Arbitration checks | external, removable, whole, unmounted |
+| Media capacity | 737,280 bytes, 512-byte blocks (1,440 blocks) |
+| Raw-node permission | denied for `/dev/rdisk4` with `errno` 13 |
+| `inspect` hardware result | Permission denied (exit 3); no UFI commands issued |
+| Subsequent USB state | Device remained electrically visible but became unregistered/unmatched; its SCSI and `IOMedia` nodes disappeared before the corrected metadata build could be rechecked |
 | `test-1581` hardware result | **inconclusive — not performed** |
-| Reason | No matching external floppy media was visible, and no live temporary-controller-change acknowledgement was given |
+| Reason | Exclusive SCSI inspection requires a manual trusted `sudo` run; no live temporary-controller-change acknowledgement was given |
 
-The supplied 1,440-block baseline is not presented as a new live probe result.
-Run `list`, `inspect`, and then the explicitly acknowledged `test-1581`
-locally to replace the inconclusive entry with supported or unsupported
-evidence. Do not record a disk number, serial number, username, or absolute
-output path in a public hardware report.
+The live `list` result confirms the supplied 1,440-block baseline. Run
+`inspect` manually with the required permission and then explicitly authorize
+`test-1581` to replace the inconclusive entry with supported or unsupported
+evidence. Do not publish a transient disk number, username, or absolute output
+path in a shared hardware report.

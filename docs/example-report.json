@@ -5,6 +5,7 @@
   },
   "device": {
     "bsd_name": "diskN",
+    "name": "TEAC USB UF000x",
     "usb": {
       "vid": {
         "numeric": 1604,
@@ -14,9 +15,13 @@
         "numeric": 0,
         "hex": "0x0000"
       },
+      "device_revision": {
+        "numeric": 512,
+        "hex": "0x0200"
+      },
       "manufacturer": "TEACV0.0",
-      "product": "TEAC USB UF000x",
-      "product_revision": "0200",
+      "product": "TEACV0.0",
+      "product_revision": "0x0200",
       "known_controller": true
     }
   },
