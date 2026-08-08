@@ -131,6 +131,15 @@ Treat `sudo test-1581` with the same caution as any low-level hardware
 diagnostic, even though its executable SCSI allowlist contains no
 floppy-media write opcode.
 
+### Known macOS SCSITaskLib limitation
+
+On the tested macOS 26.5.2 stack, the TEAC drive is attached as a direct-access
+block device with the in-kernel block-storage driver. macOS does not publish
+the SCSITask plug-in/user-client properties on that service, so the documented
+`SCSITaskDeviceInterface` cannot be created even with `sudo`. The probe reports
+this as an API/transport limitation before issuing INQUIRY. It does not detach
+the kernel driver or fall back to an undocumented pass-through mechanism.
+
 ## Safety design
 
 - Explicit opcode allowlist: TEST UNIT READY, INQUIRY, READ CAPACITY (10),

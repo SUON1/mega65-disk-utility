@@ -41,12 +41,15 @@ The BSD number is intentionally not recorded because it is unstable.
 | Media capacity | 737,280 bytes, 512-byte blocks (1,440 blocks) |
 | Raw-node permission | denied for `/dev/rdisk4` with `errno` 13 |
 | `inspect` hardware result | Permission denied (exit 3); no UFI commands issued |
-| Subsequent USB state | Device remained electrically visible but became unregistered/unmatched; its SCSI and `IOMedia` nodes disappeared before the corrected metadata build could be rechecked |
+| `inspect` with manual `sudo` | Transport/API failure (exit 4) before INQUIRY: `IOCreatePlugInInterfaceForService` returned `kIOReturnUnsupported` (`0xe00002c7`) |
+| Apple API finding | The direct-access peripheral (`Peripheral Device Type` 0) has an in-kernel block-storage driver and no SCSITask plug-in/user-client properties; the documented interface cannot be created |
+| Subsequent USB state | The device briefly became unregistered/unmatched, then returned with its SCSI and `IOMedia` nodes |
 | `test-1581` hardware result | **inconclusive — not performed** |
-| Reason | Exclusive SCSI inspection requires a manual trusted `sudo` run; no live temporary-controller-change acknowledgement was given |
+| Reason | macOS does not expose the required documented SCSITaskDeviceInterface for this direct-access device, so exclusive UFI commands cannot be issued under the milestone constraints |
 
-The live `list` result confirms the supplied 1,440-block baseline. Run
-`inspect` manually with the required permission and then explicitly authorize
-`test-1581` to replace the inconclusive entry with supported or unsupported
-evidence. Do not publish a transient disk number, username, or absolute output
-path in a shared hardware report.
+The live `list` result confirms the supplied 1,440-block baseline. A supported
+or unsupported 1581 result cannot be obtained through the documented
+SCSITaskLib path on this macOS driver stack. Detaching or replacing the kernel
+storage driver is outside this milestone and is not attempted. Do not publish
+a transient disk number, username, or absolute output path in a shared
+hardware report.

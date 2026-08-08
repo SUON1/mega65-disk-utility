@@ -5,6 +5,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOBSD.h>
 #include <IOKit/IOCFPlugIn.h>
+#include <IOKit/IOKitKeys.h>
 #include <IOKit/IOKitLib.h>
 #include <IOKit/scsi/SCSITaskLib.h>
 
@@ -225,29 +226,76 @@ static const char *normalize_name(const char *bsd_name)
     return name;
 }
 
+static bool is_direct_access_scsi_service(io_registry_entry_t service)
+{
+    CFTypeRef value = IORegistryEntryCreateCFProperty(
+        service, CFSTR("Peripheral Device Type"), kCFAllocatorDefault, 0U);
+    int32_t device_type = -1;
+    bool direct_access = false;
+    if (value != NULL) {
+        if (CFGetTypeID(value) == CFNumberGetTypeID() &&
+            CFNumberGetValue((CFNumberRef)value, kCFNumberSInt32Type, &device_type)) {
+            direct_access = device_type == 0;
+        }
+        CFRelease(value);
+    }
+    return direct_access;
+}
+
+static bool exposes_scsi_task_plugin(io_registry_entry_t service)
+{
+    CFTypeRef value = IORegistryEntryCreateCFProperty(
+        service, CFSTR(kIOCFPlugInTypesKey), kCFAllocatorDefault, 0U);
+    CFStringRef type_string;
+    bool exposed = false;
+    if (value == NULL || CFGetTypeID(value) != CFDictionaryGetTypeID()) {
+        if (value != NULL) {
+            CFRelease(value);
+        }
+        return false;
+    }
+    type_string = CFUUIDCreateString(kCFAllocatorDefault,
+                                     kIOSCSITaskDeviceUserClientTypeID);
+    if (type_string != NULL) {
+        exposed = CFDictionaryContainsKey((CFDictionaryRef)value, type_string);
+        CFRelease(type_string);
+    }
+    CFRelease(value);
+    return exposed;
+}
+
 static SCSITaskDeviceInterface **copy_task_interface(io_service_t media,
-                                                     IOReturn *last_result)
+                                                     IOReturn *last_result,
+                                                     bool *saw_direct_access,
+                                                     bool *saw_task_plugin)
 {
     io_registry_entry_t current = media;
     SCSITaskDeviceInterface **device_interface = NULL;
     while (current != IO_OBJECT_NULL) {
         IOCFPlugInInterface **plugin = NULL;
         SInt32 score = 0;
-        IOReturn create_result = IOCreatePlugInInterfaceForService(
-            current, kIOSCSITaskDeviceUserClientTypeID, kIOCFPlugInInterfaceID,
-            &plugin, &score);
-        *last_result = create_result;
-        if (create_result == kIOReturnSuccess && plugin != NULL) {
-            HRESULT query_result = (*plugin)->QueryInterface(
-                plugin, CFUUIDGetUUIDBytes(kIOSCSITaskDeviceInterfaceID),
-                (LPVOID *)(void *)&device_interface);
-            (void)IODestroyPlugInInterface(plugin);
-            if (query_result == S_OK && device_interface != NULL) {
-                IOObjectRelease(current);
-                return device_interface;
+        if (is_direct_access_scsi_service(current)) {
+            *saw_direct_access = true;
+        }
+        if (exposes_scsi_task_plugin(current)) {
+            IOReturn create_result;
+            *saw_task_plugin = true;
+            create_result = IOCreatePlugInInterfaceForService(
+                current, kIOSCSITaskDeviceUserClientTypeID, kIOCFPlugInInterfaceID,
+                &plugin, &score);
+            *last_result = create_result;
+            if (create_result == kIOReturnSuccess && plugin != NULL) {
+                HRESULT query_result = (*plugin)->QueryInterface(
+                    plugin, CFUUIDGetUUIDBytes(kIOSCSITaskDeviceInterfaceID),
+                    (LPVOID *)(void *)&device_interface);
+                (void)IODestroyPlugInInterface(plugin);
+                if (query_result == S_OK && device_interface != NULL) {
+                    IOObjectRelease(current);
+                    return device_interface;
+                }
+            } else if (plugin != NULL) {
+                (void)IODestroyPlugInInterface(plugin);
             }
-        } else if (plugin != NULL) {
-            (void)IODestroyPlugInInterface(plugin);
         }
         {
             io_registry_entry_t parent = IO_OBJECT_NULL;
@@ -269,6 +317,8 @@ M65Transport *m65_scsi_transport_create(const char *bsd_name,
     io_service_t media;
     SCSITaskDeviceInterface **device_interface;
     IOReturn last_result = kIOReturnUnsupported;
+    bool saw_direct_access = false;
+    bool saw_task_plugin = false;
     M65Transport *transport;
     MacScsiContext *context;
 
@@ -296,7 +346,8 @@ M65Transport *m65_scsi_transport_create(const char *bsd_name,
         }
         return NULL;
     }
-    device_interface = copy_task_interface(media, &last_result);
+    device_interface = copy_task_interface(media, &last_result,
+                                           &saw_direct_access, &saw_task_plugin);
     if (device_interface == NULL) {
         M65TransportStatus mapped = map_io_return(last_result);
         if (mapped == M65_TRANSPORT_OK) {
@@ -306,10 +357,17 @@ M65Transport *m65_scsi_transport_create(const char *bsd_name,
             *status = mapped;
         }
         if (detail != NULL && detail_size > 0U) {
-            (void)snprintf(detail, detail_size,
-                           "no documented SCSITaskDeviceInterface is available for %s "
-                           "(IOReturn 0x%08x)",
-                           name, (unsigned int)last_result);
+            if (saw_direct_access && !saw_task_plugin) {
+                (void)snprintf(detail, detail_size,
+                    "macOS does not publish an SCSITaskDeviceInterface for direct-access "
+                    "device %s while its in-kernel block-storage driver is attached",
+                    name);
+            } else {
+                (void)snprintf(detail, detail_size,
+                               "no documented SCSITaskDeviceInterface is available for %s "
+                               "(IOReturn 0x%08x)",
+                               name, (unsigned int)last_result);
+            }
         }
         return NULL;
     }
