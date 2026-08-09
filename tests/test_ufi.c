@@ -12,6 +12,9 @@ static void test_cdbs(void)
     length = m65_cdb_test_unit_ready(cdb);
     EXPECT_EQ_U64(length, 6U);
     EXPECT_MEMEQ(cdb, ((const uint8_t[16]){0x00U}), 16U);
+    length = m65_cdb_request_sense(cdb, 18U);
+    EXPECT_EQ_U64(length, 6U);
+    EXPECT_MEMEQ(cdb, ((const uint8_t[16]){0x03U, 0U, 0U, 0U, 18U}), 16U);
     length = m65_cdb_inquiry(cdb, 96U);
     EXPECT_EQ_U64(length, 6U);
     EXPECT_MEMEQ(cdb, ((const uint8_t[16]){0x12U, 0U, 0U, 0U, 96U}), 16U);
@@ -161,6 +164,18 @@ static void test_allowlist(void)
     data[9] = 30U;
     EXPECT_TRUE(m65_validate_command(&command, detail, sizeof(detail)));
     data[8] = 0x08U;
+    EXPECT_FALSE(m65_validate_command(&command, detail, sizeof(detail)));
+
+    (void)memset(&command, 0, sizeof(command));
+    command.cdb_length = m65_cdb_request_sense(command.cdb, 18U);
+    command.direction = M65_DATA_IN;
+    command.data = data;
+    command.data_length = 18U;
+    EXPECT_TRUE(m65_validate_command(&command, detail, sizeof(detail)));
+    command.data_length = 17U;
+    EXPECT_FALSE(m65_validate_command(&command, detail, sizeof(detail)));
+    command.data_length = 18U;
+    command.direction = M65_DATA_OUT;
     EXPECT_FALSE(m65_validate_command(&command, detail, sizeof(detail)));
 }
 

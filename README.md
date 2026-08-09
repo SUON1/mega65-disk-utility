@@ -16,9 +16,21 @@ A Commodore 1581 / MEGA65 D81 image requires 1,600 blocks:
 80 cylinders × 2 heads × 10 sectors/track × 512 bytes = 819,200 bytes
 ```
 
-The probe determines whether the controller can temporarily accept the
-250 kbit/s, 80-cylinder, 10-sector geometry and read all 1,600 sectors. It
-never sends a floppy-media write command.
+`/dev/rdiskN` is not a flux-level view of the magnetic medium. It is the
+sector window that the USB-floppy firmware and the macOS storage driver chose
+to publish; for this disk that window contains only 1,440 sectors. The probe's
+direct USB path instead seizes the known UFI/CBI interface and sends documented
+sector-level UFI commands without going through that block-device window.
+This is the rawest documented access offered by this controller, but it is
+still decoded 512-byte sectors, not magnetic transitions or track flux.
+
+The probe determines whether the controller firmware can temporarily accept
+the 250 kbit/s, 80-cylinder, 10-sector geometry and read all 1,600 sectors.
+If the firmware accepts that geometry, two matching reads can be reconstructed
+as a canonical 819,200-byte D81 image. If the bridge firmware exposes only
+nine sectors per head, software cannot recover the missing sectors through
+the 1,440-sector macOS block view. The probe never sends a floppy-media write
+command.
 
 The core library now also contains a read-only 1581 layout translator. It maps
 the 80 × 40 Commodore logical sectors of 256 bytes to the controller's
@@ -39,8 +51,9 @@ apply.
 - Known controller: VID `0x0644`, PID `0x0000`, TEAC USB UF000x family
 
 Only the C/POSIX runtime supplied by macOS and the CoreFoundation, IOKit
-(`IOKit/scsi/SCSITaskLib.h`), and DiskArbitration frameworks are used. There
-is no libusb, JSON dependency, or other third-party runtime dependency.
+(including the documented IOUSBLib and SCSITaskLib interfaces), and
+DiskArbitration frameworks are used. There is no libusb, JSON dependency, or
+other third-party runtime dependency.
 
 ## Build and test
 
@@ -84,7 +97,9 @@ Enumerate matching controllers:
 ./build/debug/m65floppy-probe list --json
 ```
 
-Inspect one unmounted whole medium using only non-state-changing UFI commands:
+Inspect one unmounted whole medium through direct USB UFI/CBI. The command is
+media-read-only; its automatic REQUEST SENSE operations may consume controller
+sense state but never write the floppy:
 
 ```sh
 ./build/debug/m65floppy-probe inspect --device disk4
@@ -112,9 +127,20 @@ Optionally save a new image only after two complete reads match:
 MODE SELECT (10). It first saves the controller's complete MODE SENSE
 response, checks the changeability mask, verifies the accepted values, reads
 LBA 9 and LBA 1599, performs two independent full reads, compares them, and
-restores the original Flexible Disk page on success, failure, timeout,
-unplug, or interruption. It refuses to start without the acknowledgement
-flag.
+attempts to restore the original Flexible Disk page on every success, failure,
+timeout, unplug, or interruption path. If an unplug or transport failure makes
+restoration impossible, the result is inconclusive and says so. It refuses to
+start without the acknowledgement flag.
+
+If a timeout loses CBI phase synchronization, the backend first performs the
+fixed non-data Command Block Reset defined by the CBI specification, clears
+both bulk endpoint stalls/toggles, and only then retries restoration. That
+internal controller reset has no caller-supplied bytes and is not a floppy
+media command.
+
+The command succeeds and permits D81 output only if the USB bridge firmware
+accepts and reads ten sectors per head. It cannot infer or synthesize the 160
+sectors omitted from a 720 KiB block-device view.
 
 An output file is created with exclusive creation and is never overwritten.
 The program rejects `/dev/disk*` and `/dev/rdisk*` output paths.
@@ -125,10 +151,13 @@ Disk Arbitration must confirm that selected media is external, removable,
 whole, and unmounted. A mounted, internal, non-removable, partition/slice, or
 non-512-byte device is rejected before SCSI access.
 
-Raw disk nodes are normally owned by `root:operator`. A permission failure is
-reported as exit code 3 with an explanation. The program never invokes
-`sudo`. If local policy permits and the exact device has been checked with
-`list`, rerun the chosen command manually:
+Raw disk nodes are normally owned by `root:operator`, but raw-node readability
+is informational and does not gate the direct USB CBI path. Opening the USB
+interface exclusively can still be denied by macOS. A privilege denial is
+exit code 3; a refusal that persists as root is a transport limitation and
+exit code 4. Both include an explanation. The program never invokes `sudo`.
+If local policy permits and the exact device has been checked with `list`,
+rerun the chosen command manually:
 
 ```sh
 sudo ./build/debug/m65floppy-probe inspect --device disk4
@@ -138,27 +167,44 @@ Treat `sudo test-1581` with the same caution as any low-level hardware
 diagnostic, even though its executable SCSI allowlist contains no
 floppy-media write opcode.
 
-### Known macOS SCSITaskLib limitation
+### macOS direct USB transport
 
 On the tested macOS 26.5.2 stack, the TEAC drive is attached as a direct-access
 block device with the in-kernel block-storage driver. macOS does not publish
 the SCSITask plug-in/user-client properties on that service, so the documented
-`SCSITaskDeviceInterface` cannot be created even with `sudo`. The probe reports
-this as an API/transport limitation before issuing INQUIRY. It does not detach
-the kernel driver or fall back to an undocumented pass-through mechanism.
+`SCSITaskDeviceInterface` cannot be created even with `sudo`.
+
+The new backend follows the drive's I/O Registry ancestry to its documented
+USB mass-storage interface and uses IOUSBLib. `USBInterfaceOpenSeize`
+temporarily detaches the kernel block-storage driver, so `/dev/diskN` may
+disappear while a diagnostic owns the interface. Closing the interface on
+every exit path allows the kernel driver to match again; the returning BSD
+disk number is not guaranteed to be the same. Disk Arbitration safety checks
+are completed before the seize. The documented plug-in can be created, but on
+the tested host the Apple mass-storage owner refused
+`USBInterfaceOpenSeize` both normally and under a manual `sudo` run. No UFI
+command was sent. See [hardware-results.md](docs/hardware-results.md).
 
 ## Safety design
 
-- Explicit opcode allowlist: TEST UNIT READY, INQUIRY, READ CAPACITY (10),
-  READ FORMAT CAPACITIES, MODE SENSE (10), READ (10), and MODE SELECT (10).
+- Explicit opcode allowlist: TEST UNIT READY, REQUEST SENSE, INQUIRY,
+  READ CAPACITY (10), READ FORMAT CAPACITIES, MODE SENSE (10), READ (10), and
+  MODE SELECT (10).
 - MODE SELECT (10) is the only data-out command. Its validator accepts only
   an eight-byte parameter header followed by exactly one 32-byte Flexible
   Disk page `0x05`.
 - FORMAT UNIT, every WRITE variant, WRITE AND VERIFY, and vendor-specific
   data-out commands are rejected before the backend sees them.
 - Raw disk nodes are never opened for writing.
-- Exclusive SCSI access is obtained before UFI diagnostics and released on
-  every exit path.
+- Exclusive USB-interface access is obtained before UFI diagnostics and
+  released on every exit path.
+- UFI commands are padded to the required 12-byte CBI command block. The
+  backend processes the command-completion interrupt and obtains detailed
+  sense key/ASC/ASCQ information with REQUEST SENSE.
+- Timeout recovery can send only the CBI specification's fixed, non-data
+  Command Block Reset; it then clears both bulk endpoints before any saved
+  Flexible Disk page is restored. It cannot carry media data or bypass the
+  UFI opcode validator.
 - Signal-aware cleanup stops further reads but still permits restoration.
 - Command builders and response parsers are independent of hardware and are
   exercised with a stateful fake transport.

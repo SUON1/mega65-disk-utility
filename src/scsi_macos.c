@@ -120,7 +120,9 @@ static M65CommandResult mac_execute(M65Transport *transport, const M65Command *c
     }
     if (!m65_validate_command(command, validation_detail, sizeof(validation_detail))) {
         result.transport_status = M65_TRANSPORT_PROTOCOL;
-        (void)snprintf(result.detail, sizeof(result.detail), "%s", validation_detail);
+        (void)snprintf(result.detail, sizeof(result.detail), "%s",
+                       validation_detail[0] != '\0' ? validation_detail :
+                       "command failed diagnostic allowlist validation");
         return result;
     }
     task = (*context->device)->CreateSCSITask(context->device);

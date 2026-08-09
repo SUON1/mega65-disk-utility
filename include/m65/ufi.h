@@ -8,6 +8,7 @@
 #include <stdint.h>
 
 #define M65_OPCODE_TEST_UNIT_READY 0x00U
+#define M65_OPCODE_REQUEST_SENSE 0x03U
 #define M65_OPCODE_INQUIRY 0x12U
 #define M65_OPCODE_READ_FORMAT_CAPACITIES 0x23U
 #define M65_OPCODE_READ_CAPACITY_10 0x25U
@@ -86,6 +87,7 @@ typedef struct {
 const char *m65_flexible_field_name(M65FlexibleField field);
 
 size_t m65_cdb_test_unit_ready(uint8_t cdb[16]);
+size_t m65_cdb_request_sense(uint8_t cdb[16], uint8_t allocation_length);
 size_t m65_cdb_inquiry(uint8_t cdb[16], uint8_t allocation_length);
 size_t m65_cdb_read_capacity_10(uint8_t cdb[16]);
 size_t m65_cdb_read_format_capacities(uint8_t cdb[16], uint16_t allocation_length);

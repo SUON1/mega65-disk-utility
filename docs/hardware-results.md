@@ -29,7 +29,9 @@ unmounted whole raw device with:
 | Required 1581 blocks | 1,600 |
 | Required 1581 bytes | 819,200 |
 
-The BSD number is intentionally not recorded because it is unstable.
+The BSD number is not a stable hardware identifier and must never be
+hardcoded. The live observation below records it only to make that one test
+reproducible.
 
 ## Live probe result — 2026-08-08
 
@@ -45,14 +47,58 @@ The BSD number is intentionally not recorded because it is unstable.
 | Apple API finding | The direct-access peripheral (`Peripheral Device Type` 0) has an in-kernel block-storage driver and no SCSITask plug-in/user-client properties; the documented interface cannot be created |
 | Subsequent USB state | The device briefly became unregistered/unmatched, then returned with its SCSI and `IOMedia` nodes |
 | `test-1581` hardware result | **inconclusive — not performed** |
-| Reason | macOS does not expose the required documented SCSITaskDeviceInterface for this direct-access device, so exclusive UFI commands cannot be issued under the milestone constraints |
+| Reason at time of test | macOS did not expose the required documented SCSITaskDeviceInterface for this direct-access device, so that backend could not issue exclusive UFI commands |
 
 The live `list` result confirms the supplied 1,440-block baseline. A supported
 or unsupported 1581 result cannot be obtained through the documented
-SCSITaskLib path on this macOS driver stack. Detaching or replacing the kernel
-storage driver is outside this milestone and is not attempted. Do not publish
-a transient disk number, username, or absolute output path in a shared
-hardware report.
+SCSITaskLib path on this macOS driver stack. Do not publish a transient disk
+number, username, or absolute output path in a shared hardware report.
+
+## Direct USB CBI follow-up
+
+The next probe backend uses the documented IOUSBLib interface for the drive's
+USB mass-storage class `08`, UFI subclass `04`, CBI protocol `00` interface.
+It retains the interface associated with the selected BSD medium, then uses
+`USBInterfaceOpenSeize` to temporarily detach the kernel block driver. UFI
+command blocks, bulk sector data, two-byte CBI completion status, and REQUEST
+SENSE therefore travel directly to the controller instead of through the
+1,440-sector `/dev/rdiskN` view. On close, the kernel storage stack is allowed
+to match again and may assign a different BSD number.
+
+| Direct CBI field | Result |
+|---|---|
+| Implementation status | Platform-neutral CBI engine complete and covered by mock/unit tests; macOS adapter compiled and live-tested through the seize boundary |
+| Interface discovery | Exact selected ancestry found: class `08`, subclass `04`, protocol `00`, three endpoints advertised |
+| Documented IOUSBLib plug-in | Created successfully; `IOUSBInterfaceInterface190` queried successfully |
+| Non-privileged interface seize | Refused with `kIOReturnExclusiveAccess` (`0xe00002c5`); no UFI command sent |
+| Manual `sudo` interface seize | Refused with the same `kIOReturnExclusiveAccess`; no UFI command sent |
+| Direct `inspect` | **inconclusive — Apple mass-storage driver retained exclusive ownership** |
+| Flexible Disk current/changeable pages | **pending** |
+| Controller acceptance of 10 sectors/head | **pending** |
+| LBA 9 and LBA 1599 reads | **pending** |
+| Two matching 1,600-sector reads | **pending** |
+| D81 output | **pending; no image has been claimed or created** |
+| Final status | **inconclusive — direct CBI is implemented, but this macOS driver stack will not yield the interface** |
+
+The direct path is still sector-level rather than flux-level; the USB bridge
+continues to decode the magnetic recording. Raw-node readability is not a
+gate for this path. A manually chosen `sudo` run was attempted and did not
+change the exclusive-access result. The program never elevates itself.
+
+The next documented macOS experiment is whole-device capture through
+`IOUSBHost`. That route terminates the kernel clients for the complete USB
+device and resets/re-registers the device during cleanup, rather than asking
+the existing mass-storage client to yield only one interface. It requires a
+small Objective-C bridge plus the Foundation and IOUSBHost frameworks, which
+are outside this milestone's original C-only/framework constraint and are not
+implemented without explicit project approval.
+
+The only permitted data-out operation remains MODE SELECT (10), constrained
+to the saved/restored or requested Flexible Disk page. It changes volatile
+controller geometry only. No floppy-media write opcode is present in the
+executable allowlist. A D81 can be created only after the firmware accepts ten
+sectors per head and two complete 819,200-byte reads match; until that happens,
+the hardware result must remain pending rather than supported.
 
 ## MEGA65 internal-drive reference
 

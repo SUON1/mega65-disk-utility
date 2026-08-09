@@ -29,6 +29,7 @@ endfunction()
 
 add_library(m65core STATIC
   src/bytes.c
+  src/cbi.c
   src/cli.c
   src/device.c
   src/json.c
@@ -47,6 +48,7 @@ find_library(DISKARBITRATION_FRAMEWORK DiskArbitration REQUIRED)
 add_library(m65mac STATIC
   src/discovery_macos.c
   src/scsi_macos.c
+  src/usb_cbi_macos.c
 )
 target_include_directories(m65mac PUBLIC include)
 target_link_libraries(m65mac PUBLIC m65core
@@ -70,6 +72,7 @@ if(BUILD_TESTING)
   add_executable(m65-unit-tests
     tests/fake_transport.c
     tests/test_bytes.c
+    tests/test_cbi.c
     tests/test_cli.c
     tests/test_device.c
     tests/test_json.c

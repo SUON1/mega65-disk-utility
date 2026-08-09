@@ -3,7 +3,7 @@
 #include "m65/discovery.h"
 #include "m65/output.h"
 #include "m65/probe.h"
-#include "m65/scsi_macos.h"
+#include "m65/usb_cbi_macos.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -118,8 +118,8 @@ static int run_selected(const M65CliOptions *options, const M65DeviceInfo *devic
     M65Transport *transport;
     char detail[M65_MAX_ERROR_TEXT] = "";
     int result_code;
-    transport = m65_scsi_transport_create(device->bsd_name, detail, sizeof(detail),
-                                          &create_status);
+    transport = m65_usb_cbi_transport_create(device->bsd_name, detail, sizeof(detail),
+                                             &create_status);
     if (options->command == M65_CLI_INSPECT) {
         M65InspectReport report;
         (void)memset(&report, 0, sizeof(report));
@@ -240,17 +240,6 @@ int main(int argc, char **argv)
                           selected->bsd_name, detail);
         }
         return 2;
-    }
-    if (!selected->readable) {
-        (void)snprintf(detail, sizeof(detail),
-                       "permission denied for %s; run manually with sudo if appropriate",
-                       selected->raw_path);
-        if (options.json) {
-            (void)m65_output_error_json(command_name(options.command), selected, detail);
-        } else {
-            (void)fprintf(stderr, "%s\n", detail);
-        }
-        return 3;
     }
     return run_selected(&options, selected);
 }

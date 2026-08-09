@@ -7,7 +7,7 @@
 
 #define M65_SCSI_STATUS_GOOD 0x00U
 #define M65_IO_TIMEOUT_MS 15000U
-#define M65_READ_CHUNK_BLOCKS 32U
+#define M65_READ_CHUNK_BLOCKS 10U
 
 static volatile sig_atomic_t interrupted = 0;
 

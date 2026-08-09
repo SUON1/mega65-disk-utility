@@ -9,6 +9,7 @@ extern int m65_test_failures;
 
 void m65_test_fail(const char *file, int line, const char *expression);
 void test_bytes(void);
+void test_cbi(void);
 void test_cli(void);
 void test_device(void);
 void test_json(void);

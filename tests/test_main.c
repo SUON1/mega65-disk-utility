@@ -14,6 +14,7 @@ void m65_test_fail(const char *file, int line, const char *expression)
 int main(void)
 {
     test_bytes();
+    test_cbi();
     test_cli();
     test_device();
     test_json();

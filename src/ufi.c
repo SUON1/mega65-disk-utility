@@ -61,6 +61,14 @@ size_t m65_cdb_test_unit_ready(uint8_t cdb[16])
     return 6U;
 }
 
+size_t m65_cdb_request_sense(uint8_t cdb[16], uint8_t allocation_length)
+{
+    cdb_clear(cdb);
+    cdb[0] = M65_OPCODE_REQUEST_SENSE;
+    cdb[4] = allocation_length;
+    return 6U;
+}
+
 size_t m65_cdb_inquiry(uint8_t cdb[16], uint8_t allocation_length)
 {
     cdb_clear(cdb);
@@ -417,6 +425,9 @@ static bool validate_data(const M65Command *command, M65DataDirection direction,
 bool m65_validate_command(const M65Command *command, char *detail, size_t detail_size)
 {
     uint16_t encoded_length;
+    if (detail != NULL && detail_size > 0U) {
+        detail[0] = '\0';
+    }
     if (command == NULL || command->cdb_length == 0U) {
         set_detail(detail, detail_size, "missing command descriptor block");
         return false;
@@ -425,6 +436,18 @@ bool m65_validate_command(const M65Command *command, char *detail, size_t detail
     case M65_OPCODE_TEST_UNIT_READY:
         return command->cdb_length == 6U &&
                validate_data(command, M65_DATA_NONE, detail, detail_size);
+    case M65_OPCODE_REQUEST_SENSE:
+        if (command->cdb_length != 6U ||
+            !validate_data(command, M65_DATA_IN, detail, detail_size) ||
+            command->cdb[1] != 0U || command->cdb[2] != 0U ||
+            command->cdb[3] != 0U || command->cdb[5] != 0U ||
+            command->cdb[4] == 0U ||
+            command->data_length != (size_t)command->cdb[4]) {
+            set_detail(detail, detail_size,
+                       "REQUEST SENSE length or reserved fields are invalid");
+            return false;
+        }
+        return true;
     case M65_OPCODE_INQUIRY:
         return command->cdb_length == 6U &&
                validate_data(command, M65_DATA_IN, detail, detail_size);
