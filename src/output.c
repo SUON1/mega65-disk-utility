@@ -476,3 +476,78 @@ void m65_output_1581_human(const M65DeviceInfo *device,
                      report->sense.key, report->sense.asc, report->sense.ascq);
     }
 }
+
+
+bool m65_output_diagnose_json(const M65DiagnoseReport *report)
+{
+    M65Json json;
+    const char *error = report->exit_code == 0 ? NULL : report->reason;
+    uint64_t last_lba;
+    if (!json_top(&json, "diagnose")) {
+        return false;
+    }
+    last_lba = report->capacity.blocks > 0U ?
+               (uint64_t)report->capacity.blocks - 1U : 0U;
+    (void)m65_json_key(&json, "diagnose");
+    (void)m65_json_begin_object(&json);
+    (void)m65_json_key(&json, "vid");
+    json_identifier(&json, report->vid);
+    (void)m65_json_key(&json, "pid");
+    json_identifier(&json, report->pid);
+    (void)m65_json_key(&json, "capture");
+    (void)m65_json_bool(&json, report->captured);
+    (void)m65_json_key(&json, "alternate_setting_selected");
+    (void)m65_json_bool(&json, report->alt_setting_ok);
+    (void)m65_json_key(&json, "inquiry");
+    (void)m65_json_begin_object(&json);
+    (void)m65_json_key(&json, "ok");
+    (void)m65_json_bool(&json, report->inquiry_ok);
+    (void)m65_json_key(&json, "vendor");
+    (void)m65_json_string(&json, report->inquiry.vendor);
+    (void)m65_json_key(&json, "product");
+    (void)m65_json_string(&json, report->inquiry.product);
+    (void)m65_json_key(&json, "firmware");
+    (void)m65_json_string(&json, report->inquiry.firmware);
+    (void)m65_json_end_object(&json);
+    (void)m65_json_key(&json, "request_sense");
+    (void)m65_json_begin_object(&json);
+    (void)m65_json_key(&json, "ok");
+    (void)m65_json_bool(&json, report->request_sense_ok);
+    (void)m65_json_key(&json, "sense");
+    json_sense(&json, &report->sense);
+    (void)m65_json_end_object(&json);
+    (void)m65_json_key(&json, "read_capacity");
+    (void)m65_json_begin_object(&json);
+    (void)m65_json_key(&json, "ok");
+    (void)m65_json_bool(&json, report->read_capacity_ok);
+    (void)m65_json_key(&json, "last_lba");
+    (void)m65_json_uint(&json, last_lba);
+    (void)m65_json_key(&json, "block_size");
+    (void)m65_json_uint(&json, report->capacity.block_size);
+    (void)m65_json_key(&json, "blocks");
+    (void)m65_json_uint(&json, report->capacity.blocks);
+    (void)m65_json_key(&json, "bytes");
+    (void)m65_json_uint(&json, (uint64_t)report->capacity.blocks *
+                               (uint64_t)report->capacity.block_size);
+    (void)m65_json_end_object(&json);
+    (void)m65_json_key(&json, "mode_sense_flexible");
+    (void)m65_json_begin_object(&json);
+    (void)m65_json_key(&json, "ok");
+    (void)m65_json_bool(&json, report->mode_sense_ok);
+    (void)m65_json_key(&json, "page");
+    json_flexible(&json, &report->flexible, false);
+    (void)m65_json_end_object(&json);
+    (void)m65_json_key(&json, "destroy");
+    (void)m65_json_bool(&json, report->destroyed);
+    (void)m65_json_end_object(&json);
+    (void)m65_json_key(&json, "result");
+    (void)m65_json_begin_object(&json);
+    (void)m65_json_key(&json, "status");
+    (void)m65_json_string(&json, report->exit_code == 0 ? "ok" : "error");
+    (void)m65_json_key(&json, "reason");
+    (void)m65_json_string(&json, report->reason);
+    (void)m65_json_end_object(&json);
+    json_errors(&json, error, report->sense.valid ? &report->sense : NULL);
+    (void)m65_json_end_object(&json);
+    return json_emit(&json);
+}
