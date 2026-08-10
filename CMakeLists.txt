@@ -92,3 +92,43 @@ if(BUILD_TESTING)
     set_tests_properties(hardware-list PROPERTIES LABELS hardware)
   endif()
 endif()
+
+# ---------------------------------------------------------------------------
+# Phase 2: IOUSBHost capture transport
+# ---------------------------------------------------------------------------
+if(APPLE)
+  # The bridge is Objective-C (ARC); enable the language so CMake compiles the
+  # .m source.  The project is otherwise pure C.
+  enable_language(OBJC)
+
+  # Compile the Objective-C bridge into the macOS backend library only.
+  target_sources(m65mac PRIVATE
+    src/transport_iousbhost.m
+  )
+  set_source_files_properties(src/transport_iousbhost.m
+    PROPERTIES COMPILE_FLAGS "-fobjc-arc"
+  )
+  target_link_libraries(m65mac PRIVATE
+    "-framework IOUSBHost"
+    "-framework Foundation"
+  )
+
+  # probe.c lives in m65core and references the IOUSBHost bridge symbols under
+  # #if defined(__APPLE__).  The executable resolves them via the .m compiled
+  # into m65mac.  The unit-test binary, however, links m65core WITHOUT m65mac,
+  # so it would fail to link with "undefined symbol" for the bridge functions.
+  # Add the no-op stub to the unit-test target ONLY (never to m65core, which
+  # would collide with the real .m definitions in the executable link).
+  if(TARGET m65-unit-tests)
+    target_sources(m65-unit-tests PRIVATE
+      src/transport_iousbhost_stubs.c
+    )
+  endif()
+endif()
+
+# Stub included for non-Apple (Linux/Windows) builds, where the .m is absent.
+if(NOT APPLE)
+  target_sources(m65core PRIVATE
+    src/transport_iousbhost_stubs.c
+  )
+endif()
