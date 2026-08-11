@@ -1,227 +1,273 @@
-# Phase 2 Handoff — IOUSBHost Capture Transport + `diagnose`
+# Phase 2 Handoff — IOUSBHost CBI I/O Adapter + `diagnose`
 
-This document records the implementation decisions, SDK observations, review
-findings, and test status for Phase 2. It is the reference for anyone building,
-verifying, or extending the IOUSBHost transport before it is merged to `main`.
+This document records the implementation decisions, SDK observations, the
+resolution of every merge-blocking review finding, and the current test status
+for Phase 2. It is the reference for anyone building, verifying, or extending
+the IOUSBHost transport before it is merged to `main`.
 
 Branch: `phase2/iousbhost-capture` (from base `ae1d960`).
 
----
-
-## 1. Scope delivered
-
-- `include/m65/transport_iousbhost_bridge.h` — pure-C bridge header. All types
-  are opaque (`m65_iousbhost_ctx_t` is forward-declared; the C side sees only a
-  `void`-equivalent pointer). No Objective-C leaks across the boundary.
-- `src/transport_iousbhost.m` — Objective-C (ARC) implementation of the bridge:
-  service discovery by VID/PID, whole-device capture, alternate-setting
-  selection, endpoint discovery, pipe opening, CBI ADSC command dispatch, bulk
-  I/O with STALL recovery, and clean teardown.
-- `src/transport_iousbhost_stubs.c` — no-op implementation for non-Apple builds
-  and for the unit-test link (see §4).
-- `diagnose` command — registered in `cli.c`/`cli.h`/`main.c`, with a
-  data-in-only probe sequence and JSON output support in `output.c`/`output.h`.
-- `test-1581` integration — IOUSBHost is opened as the preferred transport on
-  macOS in `src/probe.c`, with fallback to the existing IOUSBLib path.
-- `CMakeLists.txt` — compiles the `.m` with ARC, links `IOUSBHost` and
-  `Foundation`, and wires the stub for non-Apple and unit-test builds.
+This revision reworks the branch in response to the `phase2-codex-review.md`
+rejection. The earlier prototype exposed a raw `m65_iousbhost_send_ufi` bridge
+and layered IOUSBHost capture *in front of* the legacy IOUSBLib vtable. That
+approach is gone. IOUSBHost is now a low-level I/O adapter consumed by the
+tested `src/cbi.c` engine, exactly as the review's recommended direction
+requires.
 
 ---
 
-## 2. Implementation decisions
+## 1. Architecture
 
-### Objective-C bridge over a C core
-The existing codebase is strict C17. IOUSBHost is an Objective-C framework, so
-all Objective-C is quarantined inside `transport_iousbhost.m`. The rest of the
-program only ever sees the pure-C bridge header. This keeps `m65core` free of
-Objective-C and preserves the `-Wstrict-prototypes -Wmissing-prototypes`
-warning discipline for the C sources.
+The Objective-C layer is a thin **`M65CbiIo` adapter**. It does not implement
+any CBI/UFI protocol policy of its own. It only performs raw USB operations
+(control ADSC, bulk-in, bulk-out, interrupt-in, clear-stall, reset prep/finish,
+open/close/destroy) against an IOUSBHost-captured interface, and returns actual
+transferred byte counts and mapped status codes to `src/cbi.c`.
 
-### ARC-clean C boundary
-The context object created in `m65_iousbhost_open` is handed to the C side with
-`__bridge_retained` (transferring one +1 retain to the opaque `void*`). On
-`m65_iousbhost_close` it is reclaimed with `__bridge_transfer`, balancing the
-retain and letting ARC release it. No other bridge casts are used, so there is
-no path for an Objective-C object to escape ARC or to be double-freed.
+    m65_iousbhost_transport_create(bsd_name, ...)          [ Objective-C, .m ]
+        └─ copy_usb_interface_for_bsd_name(bsd_name)   (identity correlation)
+        └─ build M65CbiIo { ops = iousbhost_cbi_ops, context }
+        └─ m65_cbi_transport_create(io)                    [ C, src/cbi.c ]
+               └─ returns M65Transport whose ops run the tested
+                  allowlist / exact-transfer / REQUEST SENSE /
+                  completion-vs-sense / command-block-reset engine,
+                  driving the raw adapter ops below it.
 
-### No global mutable state
-All transport state (device, interface, pipes, endpoint addresses, timeouts)
-lives inside `m65_iousbhost_ctx_t`. Nothing is stored in file-scope globals, so
-concurrent contexts and repeated open/close cycles are safe.
+Because the returned object is a normal `M65Transport` built by
+`m65_cbi_transport_create`, **`diagnose`, `inspect`, and `test-1581` all flow
+end-to-end over IOUSBHost** through the identical, already-tested command
+engine. There is no second code path and no protocol logic duplicated in the
+`.m`.
 
-### VID/PID identification at runtime
-The device is matched by VID `0x0644` / PID `0x0000` at runtime. There are no
-hardcoded BSD `/dev/disk*` paths, and the drive exposes no serial number, so
-VID/PID is the only stable identifier.
+### Files
 
-### `diagnose` is strictly read-only
-`diagnose` issues only data-in UFI commands — INQUIRY, REQUEST SENSE,
-READ CAPACITY, and MODE SENSE (Flexible Disk page). It never sends MODE SELECT,
-FORMAT UNIT, WRITE, or any data-out to media. MODE SELECT remains confined to
-the `test-1581` path, which saves and restores the Flexible Disk page.
+- `include/m65/usb_cbi_iousbhost_macos.h` — pure-C header. Declares exactly one
+  symbol: `m65_iousbhost_transport_create(const char *bsd_name, char *detail,
+  size_t detail_size, M65TransportStatus *status)`. No Objective-C types cross
+  the boundary; it includes only `m65/transport.h`.
+- `src/usb_cbi_iousbhost_macos.m` — Objective-C (ARC) `M65CbiIo` adapter and the
+  factory. Contains all IOUSBHost/IOKit code.
+- `src/usb_cbi_iousbhost_stubs.c` — non-Apple build stub. Returns `NULL`, sets
+  `*status = M65_TRANSPORT_NO_DEVICE`, and clears `detail`, so the portable
+  build and the unit-test link resolve the factory symbol without any macOS SDK.
 
-### `diagnose` exit codes
-- `0` — all probed commands succeeded.
-- `1` — device not found (`M65_IOUSBHOST_ERR_NOT_FOUND`).
-- `2` — capture failed (could not take the device from the kernel driver).
-- `3` — pipe/endpoint setup failed.
-- `4` — one or more UFI commands failed. INQUIRY failure is fatal (teardown and
-  exit 4); REQUEST SENSE / READ CAPACITY / MODE SENSE failures are logged, the
-  sequence continues, and exit 4 is set at the end.
-
-### `test-1581` transport selection
-On macOS the IOUSBHost capture context is opened at the start of
-`m65_test_1581`, before exclusive access is acquired, so the kernel driver is
-detached ahead of the MODE SELECT / LBA-1599 sequence. On
-`M65_IOUSBHOST_ERR_NOT_FOUND` or any other failure the code logs to stderr and
-falls through to the existing IOUSBLib vtable path. The context is always closed
-in the cleanup section, on every exit path. The existing `M65Transport` vtable
-logic is left intact — the IOUSBHost block is a selection/ownership layer in
-front of it. Binding the capture context directly into the vtable so that UFI
-commands flow through IOUSBHost end-to-end is a Phase 3 step (see §7).
-
-### Explicit timeouts
-Per the quality standards, bulk transfers never use a zero (infinite) timeout:
-5.0 s for UFI commands and 30.0 s for sector reads. Every failure path prints
-the `IOReturn` hex code; short bulk transfers are logged as warnings rather than
-silently truncated.
+The previous filenames (`transport_iousbhost_bridge.h`, `transport_iousbhost.m`,
+`transport_iousbhost_stubs.c`) were renamed to the `usb_cbi_iousbhost_macos*`
+names to match the `usb_cbi_macos.c` IOUSBLib sibling and to signal that this is
+a CBI I/O adapter, not a standalone transport.
 
 ---
 
-## 3. SDK behavior differences from expectation
+## 2. Resolution of the review's merge-blocking findings
 
-No functional surprises were reconciled against hardware yet (see §5 — no Mac or
-device was available in the implementation environment). The implementation was
-written directly against the installed SDK header signatures quoted in the task
-spec (`IOUSBHostDefinitions.h`, `IOUSBHostObject.h`, `IOUSBHostInterface.h`,
-`IOUSBHostPipe.h`). Two build-environment facts worth flagging for the target
-machine:
+### Finding 1 — The macOS target did not build
+Fixed. The `.m` no longer depends on `kUSBEndpointDesc` and does not pass legacy
+`kIOUSBDeviceRequest*` enumerators into `IOUSBHostDeviceRequestType`:
 
-1. **`enable_language(OBJC)` is required.** The project declared only
-   `LANGUAGES C`. CMake will not compile a `.m` file until Objective-C is
-   enabled, so `enable_language(OBJC)` was added inside the `if(APPLE)` block.
-   This is an addition the task's CMake snippet omitted; it is necessary for the
-   `.m` to build at all.
+- USB descriptor parsing uses self-contained packed structs
+  (`M65UsbDescHeader`, `M65UsbConfigDesc`, `M65UsbInterfaceDesc`,
+  `M65UsbEndpointDesc`) and local `#define`s for the descriptor-type,
+  transfer-type, and direction constants. No `USBSpec.h` symbol is required.
+- The CBI ADSC control request fills an `IOUSBDeviceRequest` (`bmRequestType`
+  `0x21`, `bRequest` `0x00`, `wIndex` = interface number, `wLength` = 12)
+  field-by-field from the `M65CbiAdsc` produced by `m65_cbi_build_adsc`; it never
+  assigns a legacy enum to an `IOUSBHostDeviceRequestType`, so the
+  `-Werror` enum-conversion diagnostics cannot occur.
+- `CMakeLists.txt` compiles the `.m` with `-fobjc-arc -fmodules` (so
+  `@import Foundation; @import IOUSBHost;` is valid), enables `OBJC`, and links
+  `-framework IOUSBHost -framework Foundation`.
 
-2. **The `.m` inherits the target's strict warning set.** `m65_strict_warnings`
-   applies `-Werror -Wconversion -Wsign-conversion -Wstrict-prototypes ...` at
-   the `m65mac` target level, and `set_source_files_properties(... COMPILE_FLAGS
-   "-fobjc-arc")` only *appends* `-fobjc-arc` rather than replacing the target
-   flags. The `.m` was written to be warning-clean, but if Clang on the target
-   raises a `-Werror` warning specific to the Objective-C source (e.g.
-   `-Wstrict-prototypes` on a bridge shim), the intended fix is to relax that
-   single warning for the `.m` via its per-file `COMPILE_FLAGS`, not to weaken
-   the C target flags. This is called out as a Gate 1 watch item.
+NOTE: the `.m` still **cannot be compiled in this Linux environment** (no clang,
+no macOS SDK). It is written against the SDK signatures but is **unverified by a
+compiler** — see §5.
+
+### Finding 2 — `test-1581` was not transported over IOUSBHost
+Fixed. All three IOUSBHost/`__APPLE__` blocks were removed from `src/probe.c`;
+`m65_test_1581` is now fully transport-agnostic and drives whatever
+`M65Transport` it is given. `src/main.c` `create_selected_transport()` builds the
+IOUSBHost-backed transport (via `m65_iousbhost_transport_create` →
+`m65_cbi_transport_create`) and passes it to `m65_test_1581`, so MODE SENSE,
+MODE SELECT, READ, recovery, and restoration **all run over IOUSBHost**. The old
+"capture-then-legacy-vtable" split and its early-return cleanup leak are gone;
+`transport->ops->destroy(transport)` runs on every path.
+
+### Finding 3 — `diagnose` did not run the agreed safe sequence
+Fixed. `diagnose` calls `m65_inspect`, which issues the full staged, read-only
+UFI workflow: **INQUIRY → TEST UNIT READY → READ CAPACITY → READ FORMAT
+CAPACITIES → MODE SENSE (current) → MODE SENSE (changeable)**, with automatic
+REQUEST SENSE on check-condition. TEST UNIT READY is a no-data command; every
+other step is data-in. No data-out is ever issued.
+
+### Finding 4 — The raw bridge bypassed the CBI/UFI safety engine
+Fixed by the architecture in §1. There is no `m65_iousbhost_send_ufi` any more.
+Every command goes through `src/cbi.c`, so `m65_validate_command` (allowlist),
+command-block reset/recovery, exact-transfer accounting, automatic REQUEST
+SENSE, and completion-vs-sense validation are all enforced. The adapter returns
+**actual** transferred lengths (not requested lengths) and requires **exactly
+two** interrupt-status bytes — a short or mismatched completion is surfaced as a
+failure to the engine, never reported as success or parsed as zero-filled data.
+
+### Finding 5 — Device identity was not correlated
+Fixed. `diagnose` now **requires `--device <bsd-name>`** and goes through the
+same discovery/validation as `inspect`/`test-1581`
+(external, removable, whole, unmounted, 512-byte media). The factory's
+`copy_usb_interface_for_bsd_name()` starts from that exact BSD node
+(`IOBSDNameMatching`), walks up the IORegistry parent chain to the owning USB
+interface, and confirms identity (interface class `0x08` / subclass `0x04` /
+protocol `0x00`, VID `0x0644`, PID `0x0000`) before capture. The capture is
+therefore proven to be the same physical device selected by `--device`; there is
+no free-floating `IOServiceGetMatchingService` first-match and no independent
+VID/PID hardcode driving a second device.
+
+### Additional corrections
+- **Cleanup on every path** — `open_seize` failure, ADSC/bulk/interrupt failure,
+  timeout, unplug, and interruption all funnel through the engine and
+  `destroy`. §8 documents the unplug/replug recovery action.
+- **Bounded descriptor walking** — the configuration descriptor is validated
+  against `wTotalLength` and every header length is bounds-checked before it is
+  dereferenced; endpoint discovery requires exactly bulk-IN + bulk-OUT +
+  interrupt-IN (with `wMaxPacketSize == M65_CBI_STATUS_LENGTH`, i.e. 2).
+- **Exact hex evidence** — every IOKit/IOUSBHost failure path prints the raw
+  `IOReturn 0x%08x`, not just a localized description.
+- **Tests** — new coverage for `diagnose` CLI parsing/validation, the exit-code
+  mapping, and JSON body (see §4).
 
 ---
 
-## 4. Unit-test linkage deviation (necessary)
+## 3. `diagnose` command
 
-`src/probe.c` lives in the `m65core` static library and, on macOS, now
-references `m65_iousbhost_open` and `m65_iousbhost_close` under
-`#if defined(__APPLE__)`.
+Usage:
 
-- The **executable** (`m65floppy-probe`) links `m65mac`, which compiles the real
-  `transport_iousbhost.m`, so those symbols resolve there.
-- The **unit-test binary** (`m65-unit-tests`) links `m65core` *without* `m65mac`.
-  Without intervention it would fail to link with "undefined symbol" for the
-  bridge functions.
+    m65floppy-probe diagnose --device <bsd-name> [--vid <id>] [--pid <id>] [--json]
 
-Resolution: `src/transport_iousbhost_stubs.c` is added **only to the
-`m65-unit-tests` target** (guarded by `if(TARGET m65-unit-tests)`), never to
-`m65core`. Adding it to `m65core` would collide with the real `.m` definitions
-in the executable link (duplicate symbols). This keeps the existing unit tests
-(including the `src/cbi.c` tests) linking and passing unchanged, and satisfies
-the "no undefined symbol" requirement of Gate 1. `src/cbi.c` itself was not
-modified.
+- `--device` is **required** (Finding 5). `--output` and
+  `--ack-temporary-controller-change` are rejected for `diagnose` (it never
+  writes media and never changes the controller). `--vid`/`--pid`/`--json` are
+  accepted; `--vid`/`--pid` remain rejected for `list`/`inspect`/`test-1581`.
+- `diagnose` is strictly read-only: it opens the IOUSBHost capture transport,
+  runs `m65_inspect` (§2 Finding 3), destroys the transport, and reports.
+
+### Exit codes (`m65_diagnose_exit_code`, unit-tested in `tests/test_diagnose.c`)
+
+| Condition | Exit |
+|---|---|
+| Transport not created, `create_status == NO_DEVICE` | 1 |
+| Transport not created, any other status (permission/timeout/protocol/IO) | 2 |
+| Transport created, inspect `M65_PROBE_OK` | 0 |
+| Transport created, inspect `M65_PROBE_NO_DEVICE` | 1 |
+| Transport created, inspect `M65_PROBE_PERMISSION` | 2 |
+| Transport created, inspect any other probe code | 4 |
+
+### JSON output
+`m65_output_diagnose_json` emits a top-level `diagnose` object with
+`schema_version: 1` (unchanged), `transport: "iousbhost"`, the VID/PID
+identifier, `captured`/`destroyed` booleans, a `ufi` body (present when
+captured), the numeric `exit_code`, and any error text. The `ufi` body is
+produced by a shared helper (`json_inspect_ufi_body`) also used by
+`m65_output_inspect_json`, so `diagnose` and `inspect` report identical UFI
+evidence.
+
+**Additive schema note:** the shared UFI body now includes a
+`changeable_flexible_disk` object (the MODE SENSE *changeable* Flexible Disk
+page) alongside the existing current-page `flexible_disk`. This is purely
+additive — no existing key changed name, type, or meaning — so `schema_version`
+remains `1`.
 
 ---
 
-## 5. Cross-check findings from ChatGPT 5.6 Sol
+## 4. Tests
+
+All portable unit tests build and pass in this environment (Linux, GCC). The
+test binary links `m65core` only — no macOS symbols — and the non-Apple stub
+resolves the factory.
+
+- `tests/test_diagnose.c` (new) — 12 assertions covering every branch of
+  `m65_diagnose_exit_code`.
+- `tests/test_cli.c` — `diagnose` requires `--device`; parses
+  `--device`/`--vid`/`--pid`/`--json`; rejects `--output`; rejects
+  `--ack-temporary-controller-change`; `inspect` still rejects `--vid`.
+- Registered in `tests/test.h` and `tests/test_main.c`.
+
+The `src/cbi.c` engine tests (allowlist, exact accounting, REQUEST SENSE,
+reset/recovery) are unchanged and still pass, which is what gives confidence
+that the new adapter — feeding that same engine — inherits those guarantees.
+
+---
+
+## 5. Cross-check with ChatGPT 5.6 Sol
 
 **Status: PENDING — not yet performed.**
 
-The task's §12 cross-check workflow (pasting the bridge header, the `.m`
-implementation, and the `test-1581` integration into ChatGPT 5.6 Sol using the
-five-concern review prompt) could not be run in the implementation environment.
-This is a **required manual step before merging to `main`.**
-
-The five concerns to review:
-1. Correct usage of `IOUSBHostInterface` / `IOUSBHostPipe` / `IOUSBHostObject`
-   against the actual method signatures.
-2. ARC memory-management errors (missing/over-releases, incorrect `__bridge`
-   casts, ObjC objects escaping ARC across the C boundary).
-3. Correct CBI ADSC control-request construction (`bmRequestType` = `0x21`,
-   `bRequest` = `0x00`, `wIndex`, `wLength`) for a UFI command send.
-4. STALL recovery — every bulk-transfer error path must call
-   `clearStallWithError:` before the next command.
-5. No code path that can send a write opcode (FORMAT UNIT `0x04`, WRITE `0x2A`,
-   or any data-out to floppy media sectors).
-
-When the review is run, apply every factually-correct finding and record each
-applied change in this section (what changed, and why).
+The task's §12 cross-check (pasting the header, the `.m` adapter, and the CLI
+wiring into ChatGPT 5.6 Sol with the five-concern prompt) has not been run in
+this environment. It remains a **required manual step before merging.** The five
+concerns: (1) correct `IOUSBHostInterface`/`IOUSBHostPipe`/`IOUSBHostObject`
+usage; (2) ARC memory correctness (`__bridge_retained`/`__bridge_transfer`
+balance, no ObjC escaping ARC); (3) correct CBI ADSC control request
+(`0x21`/`0x00`/wIndex/wLength=12); (4) STALL recovery via `clearStall...` on
+every bulk error before the next command; (5) no path that can emit a write
+opcode (FORMAT UNIT `0x04`, WRITE `0x2A`, or any media data-out). Record every
+applied finding here when the review is run.
 
 ---
 
 ## 6. Test results — hardware gates
 
-**Status: ALL PENDING.** No Apple Silicon Mac and no TEAC drive were available
-in the implementation environment, so none of the seven gates in
-`docs/phase2-test-checklist.md` have been executed on hardware.
+**Status: ALL PENDING.** No Apple Silicon Mac and no TEAC drive were available,
+so none of the gates in `docs/phase2-test-checklist.md` ran on hardware.
 
-What *was* verified in the implementation environment (Linux, no macOS SDK):
+Verified in this environment (Linux, no macOS SDK):
 
 - All portable C sources — `cli.c`, `main.c`, `output.c`, `probe.c`,
-  `transport_iousbhost_stubs.c`, and the rest of `m65core` — compile cleanly
-  under the project's strict warning set (`-Wall -Wextra -Wpedantic -Werror
-  -Wconversion -Wsign-conversion -Wshadow -Wstrict-prototypes
+  `usb_cbi_iousbhost_stubs.c`, and the rest of `m65core` — object-compile
+  cleanly under the project's strict warning set (`-Wall -Wextra -Wpedantic
+  -Werror -Wconversion -Wsign-conversion -Wshadow -Wstrict-prototypes
   -Wmissing-prototypes`). The only `-Werror` hits were GCC-only
-  `-Wformat-truncation` diagnostics on *pre-existing* lines
-  (`probe.c:86`, `probe.c:542`, `main.c:361`); Clang (the macOS compiler) does
-  not raise these.
-- `src/probe.c` compiles cleanly both with and without `__APPLE__` defined, so
-  both the IOUSBHost path and the fallback path are syntactically valid.
-- The `CMakeLists.txt` Phase 2 block parses and configures correctly.
+  `-Wformat-truncation` diagnostics on **pre-existing** lines
+  (`probe.c` `copy_command_failure`, `main.c` write-image message), confirmed
+  identical on base `ae1d960`; Clang (the macOS compiler) does not implement
+  that warning.
+- The full `m65core` + unit-test binary builds and runs: `all unit tests
+  passed`, exit 0.
 - The `.m` file **cannot** be compiled here (no macOS/IOUSBHost SDK). It is
-  written against the spec's SDK signatures but is **unverified by a compiler**.
+  **unverified by a compiler.** Gate 1 on the target Mac is the first real
+  compile.
 
-Gates 1–7 (build, diagnose device discovery, INQUIRY, READ CAPACITY, MODE
-SENSE, `test-1581`, driver restoration) must be run on the target Mac and their
-results recorded in the checklist.
+Gates 1–7 must be run on the target Mac and recorded in the checklist.
 
 ---
 
-## 7. Next steps for Phase 3
+## 7. Next steps before merge
 
-1. **Run the cross-check (§5) and the hardware gates (§6) on the target Mac.**
-   These are prerequisites for merging the branch.
-2. **Bind the capture context into the transport vtable.** Currently
-   `test-1581` opens/owns the IOUSBHost context but UFI commands still flow
-   through the IOUSBLib vtable. Phase 3 should implement an `M65Transport` whose
-   `ops` dispatch through `m65_iousbhost_send_ufi`, so the whole `test-1581`
-   sequence (MODE SENSE, MODE SELECT, READ) runs over IOUSBHost.
-3. **Surface endpoint addresses in JSON.** The bridge currently exposes
-   endpoints only via `m65_iousbhost_print_endpoints` (stdout). Human-readable
-   `diagnose` prints them; JSON `diagnose` cannot include them without a getter.
-   Add an accessor to the bridge if endpoints are needed in machine-readable
-   output.
-4. **Sector capture / D81 imaging over IOUSBHost.** Extend beyond the boundary
-   reads to full whole-device capture using the 30 s sector-read timeout path.
-5. **Consider a per-file warning relaxation for the `.m`** if Gate 1 surfaces a
-   Clang `-Werror` warning that is not worth addressing in source (see §3.2).
+1. Build on the target Mac (Gate 1) and fix any Clang-specific diagnostics. If a
+   single `-Werror` warning is specific to the `.m`, relax that one warning via
+   the file's per-source `COMPILE_FLAGS` — do **not** weaken the C target flags.
+2. Run the ChatGPT 5.6 Sol cross-check (§5) and apply every correct finding.
+3. Run hardware gates 1–7 (§6, checklist) on the TEAC drive under `sudo` and
+   record the exact `IOReturn` hex on any failure.
+4. Only after a clean target-Mac build and the cross-check should a human run
+   the root-only capture gate.
 
 ---
 
 ## 8. Safety constraints honored
 
 - No FORMAT UNIT (`0x04`) anywhere.
-- No WRITE (`0x2A`) or any floppy-media data-out opcode.
+- No WRITE (`0x2A`) or any floppy-media data-out opcode. `diagnose` is data-in
+  only (plus the no-data TEST UNIT READY).
+- MODE SELECT (`0x55`) is emitted only from `test-1581`, only after saving the
+  Flexible Disk page for restoration (existing, unchanged `src/ufi.c` logic).
 - No `/dev/disk*` / `/dev/rdisk*` opened `O_WRONLY`/`O_RDWR`.
 - No `setuid`/`seteuid`/internal `sudo`; root must be supplied by the caller.
 - No entitlement or code-signing changes.
-- MODE SELECT (`0x55`) is sent only from `test-1581`, only after saving the
-  Flexible Disk page for restoration (existing, unchanged logic).
-- `diagnose` sends only data-in commands.
 - `src/ufi.c`, `src/cbi.c`, and `src/layout.c` were not modified.
 - `schema_version` is unchanged (still `1`); `diagnose` JSON is emitted under a
-  new top-level `diagnose` key.
+  new top-level `diagnose` key, and the added `changeable_flexible_disk` field is
+  purely additive.
+
+### Unplug/replug recovery
+If the drive is physically removed mid-capture, IOUSBHost operations fail with
+an IOReturn (e.g. `kIOReturnNoDevice`/`kIOReturnNotAttached`); the engine maps
+this to a transport error, prints the hex code, and tears the transport down.
+Recovery action: re-plug the drive, re-run `list` to confirm the BSD node
+reappears, then re-issue the command with the (possibly new) `--device` name.
