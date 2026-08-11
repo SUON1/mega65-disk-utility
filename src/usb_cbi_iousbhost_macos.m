@@ -33,6 +33,7 @@
 #import <IOKit/IOKitLib.h>
 #import <IOKit/IOKitKeys.h>
 #import <IOKit/IOBSD.h>
+#import <IOKit/usb/USB.h>
 #import <libkern/OSByteOrder.h>
 
 #include "m65/usb_cbi_iousbhost_macos.h"
@@ -57,16 +58,7 @@
 #define M65_USB_XFER_BULK 0x02U
 #define M65_USB_XFER_INTERRUPT 0x03U
 #define M65_USB_DIR_IN 0x80U
-
-/* USB IOReturn codes that live in <IOKit/usb/USB.h>; guard-defined so this
- * translation unit does not have to pull that header alongside @import
- * IOUSBHost (which would risk descriptor-type redefinition conflicts). */
-#ifndef kIOUSBPipeStalled
-#define kIOUSBPipeStalled ((IOReturn)0xe0004061)
-#endif
-#ifndef kIOUSBTransactionTimeout
-#define kIOUSBTransactionTimeout ((IOReturn)0xe0004051)
-#endif
+#define M65_INTERRUPT_ABORT_DRAIN_MS 2000U
 
 #pragma pack(push, 1)
 typedef struct {
@@ -107,6 +99,16 @@ typedef struct {
 } M65UsbEndpointDesc;
 #pragma pack(pop)
 
+@interface M65IOUSBHostInterruptRequest : NSObject
+@property (nonatomic, strong) NSMutableData *buffer;
+@property (nonatomic, strong) dispatch_semaphore_t completion;
+@property (nonatomic) IOReturn result;
+@property (nonatomic) NSUInteger transferred;
+@end
+
+@implementation M65IOUSBHostInterruptRequest
+@end
+
 /* Strong ObjC references are held by this class; ARC forbids strong pointers in
  * a plain C struct, so the context keeps it behind a bridged void*. */
 @interface M65IOUSBHostAdapter : NSObject
@@ -114,6 +116,7 @@ typedef struct {
 @property (nonatomic, strong) IOUSBHostPipe *pipeIn;   /* bulk-IN */
 @property (nonatomic, strong) IOUSBHostPipe *pipeOut;  /* bulk-OUT */
 @property (nonatomic, strong) IOUSBHostPipe *pipeIntr; /* interrupt-IN */
+@property (nonatomic, strong) M65IOUSBHostInterruptRequest *pendingInterrupt;
 @end
 
 @implementation M65IOUSBHostAdapter
@@ -174,14 +177,19 @@ static M65CbiIoStatus map_io_return(IOReturn result)
         result == kIOReturnExclusiveAccess) {
         return M65_CBI_IO_PERMISSION;
     }
-    if (result == kIOReturnNoDevice || result == kIOReturnOffline) {
+    if (result == kIOReturnNoDevice || result == kIOReturnOffline ||
+        result == kIOReturnNotAttached) {
         return M65_CBI_IO_NO_DEVICE;
     }
     if (result == kIOReturnTimeout || result == kIOUSBTransactionTimeout) {
         return M65_CBI_IO_TIMEOUT;
     }
-    if (result == kIOReturnBadArgument || result == kIOReturnUnsupported) {
+    if (result == kIOReturnBadArgument || result == kIOReturnUnsupported ||
+        result == kIOUSBUnknownPipeErr) {
         return M65_CBI_IO_PROTOCOL;
+    }
+    if (result == kIOReturnAborted || result == kIOUSBTransactionReturned) {
+        return M65_CBI_IO_ERROR;
     }
     return M65_CBI_IO_ERROR;
 }
@@ -284,9 +292,16 @@ static bool ready_for_adsc(const IousbhostContext *context,
                            char *detail, size_t detail_size)
 {
     bool reset = is_command_block_reset(cdb);
+    M65IOUSBHostAdapter *adapter =
+        (__bridge M65IOUSBHostAdapter *)context->adapter;
     if (!context->open) {
         set_detail(detail, detail_size,
                    "IOUSBHost CBI transport is not open");
+        return false;
+    }
+    if (adapter.pendingInterrupt != nil) {
+        set_detail(detail, detail_size,
+                   "IOUSBHost CBI transport has a pending completion interrupt");
         return false;
     }
     if (context->reset_armed != reset) {
@@ -312,6 +327,79 @@ static NSTimeInterval seconds_from_ms(uint32_t timeout_ms)
         return 5.0;
     }
     return (NSTimeInterval)timeout_ms / 1000.0;
+}
+
+static dispatch_time_t dispatch_deadline_from_ms(uint32_t timeout_ms)
+{
+    uint32_t effective_ms = timeout_ms == 0U ? 1U : timeout_ms;
+    int64_t nanoseconds = (int64_t)effective_ms * 1000000LL;
+    return dispatch_time(DISPATCH_TIME_NOW, nanoseconds);
+}
+
+static bool wait_for_interrupt_request(
+    M65IOUSBHostInterruptRequest *request, uint32_t timeout_ms)
+{
+    return dispatch_semaphore_wait(request.completion,
+                                   dispatch_deadline_from_ms(timeout_ms)) == 0L;
+}
+
+/*
+ * Abort is synchronous per IOUSBHostPipe.h: it does not return until the
+ * aborted I/O has completed. The separate bounded semaphore drain observes
+ * the completion handler before the request buffer is released. If the SDK
+ * contract is ever violated, the request remains strongly retained by both
+ * the adapter and completion block, so a late callback cannot access freed
+ * storage and the caller receives a hard recovery error.
+ */
+static M65CbiIoStatus abort_and_drain_interrupt(
+    M65IOUSBHostAdapter *adapter, IOReturn *completion_result,
+    char *detail, size_t detail_size)
+{
+    M65IOUSBHostInterruptRequest *request = adapter.pendingInterrupt;
+    NSError *error = nil;
+    IOReturn abort_code = kIOReturnSuccess;
+    BOOL aborted;
+
+    if (completion_result != NULL) {
+        *completion_result = kIOReturnSuccess;
+    }
+    if (request == nil) {
+        return M65_CBI_IO_OK;
+    }
+
+    if (dispatch_semaphore_wait(request.completion, DISPATCH_TIME_NOW) == 0L) {
+        if (completion_result != NULL) {
+            *completion_result = request.result;
+        }
+        adapter.pendingInterrupt = nil;
+        return M65_CBI_IO_OK;
+    }
+
+    aborted = [adapter.pipeIntr
+        abortWithOption:IOUSBHostAbortOptionSynchronous
+                  error:&error];
+    if (!aborted) {
+        abort_code = io_return_from_error(error);
+        describe_io_return(detail, detail_size,
+                           "synchronously abort CBI interrupt-IN", abort_code);
+    }
+    if (!wait_for_interrupt_request(request, M65_INTERRUPT_ABORT_DRAIN_MS)) {
+        if (aborted) {
+            set_detail(detail, detail_size,
+                       "synchronous CBI interrupt-IN abort returned before its completion drained");
+            return M65_CBI_IO_ERROR;
+        }
+        append_io_return(detail, detail_size,
+                         "drain CBI interrupt-IN after abort failure",
+                         kIOReturnTimeout);
+        return map_io_return(abort_code);
+    }
+
+    if (completion_result != NULL) {
+        *completion_result = request.result;
+    }
+    adapter.pendingInterrupt = nil;
+    return aborted ? M65_CBI_IO_OK : map_io_return(abort_code);
 }
 
 /* ── endpoint discovery over IOUSBHost descriptors ── */
@@ -517,8 +605,8 @@ static M65CbiIoStatus iousbhost_close(M65CbiIo *io,
 {
     IousbhostContext *context = (IousbhostContext *)io->context;
     M65IOUSBHostAdapter *adapter;
-    (void)detail;
-    (void)detail_size;
+    M65CbiIoStatus abort_status = M65_CBI_IO_OK;
+    IOReturn completion_result = kIOReturnSuccess;
     if (!context->open) {
         return M65_CBI_IO_OK;
     }
@@ -527,13 +615,17 @@ static M65CbiIoStatus iousbhost_close(M65CbiIo *io,
     context->open = false;
     context->reset_armed = false;
     if (adapter != nil) {
+        abort_status = abort_and_drain_interrupt(adapter, &completion_result,
+                                                 detail, detail_size);
         [adapter.iface destroy]; /* resets device; kernel re-registers driver */
+        adapter.pendingInterrupt = nil;
         adapter.pipeIn = nil;
         adapter.pipeOut = nil;
         adapter.pipeIntr = nil;
         adapter.iface = nil;
     }
-    return M65_CBI_IO_OK;
+    (void)completion_result;
+    return abort_status;
 }
 
 static M65CbiIoStatus iousbhost_adsc(M65CbiIo *io,
@@ -622,14 +714,8 @@ static M65CbiIoStatus iousbhost_bulk_in(M65CbiIo *io, void *data, size_t length,
     if (!ok) {
         IOReturn code = io_return_from_error(error);
         describe_io_return(detail, detail_size, "CBI bulk-IN", code);
-        if (code == kIOReturnTimeout || code == kIOUSBTransactionTimeout) {
+        if (code != kIOUSBPipeStalled) {
             context->desynchronized = true;
-            NSError *stall_error = nil;
-            if (![adapter.pipeIn clearStallWithError:&stall_error]) {
-                append_io_return(detail, detail_size,
-                                 "resynchronize bulk-IN after timeout",
-                                 io_return_from_error(stall_error));
-            }
         }
         return map_io_return(code);
     }
@@ -665,14 +751,8 @@ static M65CbiIoStatus iousbhost_bulk_out(M65CbiIo *io, const void *data,
     if (!ok) {
         IOReturn code = io_return_from_error(error);
         describe_io_return(detail, detail_size, "CBI bulk-OUT", code);
-        if (code == kIOReturnTimeout || code == kIOUSBTransactionTimeout) {
+        if (code != kIOUSBPipeStalled) {
             context->desynchronized = true;
-            NSError *stall_error = nil;
-            if (![adapter.pipeOut clearStallWithError:&stall_error]) {
-                append_io_return(detail, detail_size,
-                                 "resynchronize bulk-OUT after timeout",
-                                 io_return_from_error(stall_error));
-            }
         }
         return map_io_return(code);
     }
@@ -686,45 +766,96 @@ static M65CbiIoStatus iousbhost_interrupt_in_with_deadline(
 {
     IousbhostContext *context = (IousbhostContext *)io->context;
     M65IOUSBHostAdapter *adapter = (__bridge M65IOUSBHostAdapter *)context->adapter;
+    M65IOUSBHostInterruptRequest *request;
     NSError *error = nil;
-    NSMutableData *buffer;
-    NSUInteger received = 0U;
+    IOReturn completion_result = kIOReturnSuccess;
+    M65CbiIoStatus drain_status;
+    char abort_detail[M65_MAX_ERROR_TEXT] = "";
     size_t copy_length;
-    BOOL ok;
+    BOOL submitted;
 
     *transferred = 0U;
-    buffer = [adapter.iface ioDataWithCapacity:(NSUInteger)M65_CBI_STATUS_LENGTH
-                                         error:&error];
-    if (buffer == nil) {
+    if (adapter.pendingInterrupt != nil) {
+        set_detail(detail, detail_size,
+                   "previous IOUSBHost CBI interrupt-IN has not drained");
+        return M65_CBI_IO_PROTOCOL;
+    }
+
+    request = [[M65IOUSBHostInterruptRequest alloc] init];
+    request.buffer =
+        [adapter.iface ioDataWithCapacity:(NSUInteger)M65_CBI_STATUS_LENGTH
+                                   error:&error];
+    if (request.buffer == nil) {
         IOReturn code = io_return_from_error(error);
         describe_io_return(detail, detail_size,
                            "allocate CBI interrupt-IN DMA buffer", code);
         return map_io_return(code);
     }
-    ok = [adapter.pipeIntr sendIORequestWithData:buffer
-                                bytesTransferred:&received
-                               completionTimeout:seconds_from_ms(timeout_ms)
-                                           error:&error];
-    if (!ok) {
+    request.completion = dispatch_semaphore_create(0L);
+    request.result = kIOReturnNotReady;
+    adapter.pendingInterrupt = request;
+
+    /* IOUSBHostPipe.h requires a zero framework timeout for interrupt pipes.
+     * The semaphore below owns the application deadline instead. */
+    submitted = [adapter.pipeIntr
+        enqueueIORequestWithData:request.buffer
+               completionTimeout:0.0
+                           error:&error
+               completionHandler:^(IOReturn result, NSUInteger received) {
+                   request.result = result;
+                   request.transferred = received;
+                   dispatch_semaphore_signal(request.completion);
+               }];
+    if (!submitted) {
         IOReturn code = io_return_from_error(error);
-        describe_io_return(detail, detail_size, "CBI interrupt-IN", code);
-        context->desynchronized = true;
-        if (code == kIOReturnTimeout || code == kIOUSBTransactionTimeout) {
-            NSError *stall_error = nil;
-            if (![adapter.pipeIntr clearStallWithError:&stall_error]) {
-                append_io_return(detail, detail_size,
-                                 "resynchronize interrupt-IN after timeout",
-                                 io_return_from_error(stall_error));
-            }
-            return M65_CBI_IO_TIMEOUT;
-        }
+        adapter.pendingInterrupt = nil;
+        describe_io_return(detail, detail_size,
+                           "submit asynchronous CBI interrupt-IN", code);
         return map_io_return(code);
     }
-    *transferred = (size_t)received;
-    copy_length = (size_t)received < (size_t)M65_CBI_STATUS_LENGTH ?
-                  (size_t)received : (size_t)M65_CBI_STATUS_LENGTH;
+
+    if (!wait_for_interrupt_request(request, timeout_ms)) {
+        context->desynchronized = true;
+        drain_status = abort_and_drain_interrupt(
+            adapter, &completion_result, abort_detail, sizeof(abort_detail));
+        if (drain_status != M65_CBI_IO_OK) {
+            if (abort_detail[0] != '\0') {
+                (void)snprintf(detail, detail_size,
+                               "CBI interrupt-IN exceeded its %u ms application deadline; %s",
+                               (unsigned int)timeout_ms, abort_detail);
+            } else {
+                (void)snprintf(detail, detail_size,
+                               "CBI interrupt-IN exceeded its %u ms application deadline and did not drain",
+                               (unsigned int)timeout_ms);
+            }
+            return drain_status;
+        }
+        if (map_io_return(completion_result) == M65_CBI_IO_NO_DEVICE) {
+            describe_io_return(detail, detail_size,
+                               "CBI interrupt-IN device removal during deadline abort",
+                               completion_result);
+            return M65_CBI_IO_NO_DEVICE;
+        }
+        (void)snprintf(detail, detail_size,
+                       "CBI interrupt-IN exceeded its %u ms application deadline; synchronous abort completion was IOReturn 0x%08x",
+                       (unsigned int)timeout_ms,
+                       (unsigned int)completion_result);
+        return M65_CBI_IO_TIMEOUT;
+    }
+
+    completion_result = request.result;
+    *transferred = (size_t)request.transferred;
+    copy_length = *transferred < (size_t)M65_CBI_STATUS_LENGTH ?
+                  *transferred : (size_t)M65_CBI_STATUS_LENGTH;
     if (copy_length > 0U) {
-        (void)memcpy(status, buffer.bytes, copy_length);
+        (void)memcpy(status, request.buffer.bytes, copy_length);
+    }
+    adapter.pendingInterrupt = nil;
+    if (completion_result != kIOReturnSuccess) {
+        context->desynchronized = true;
+        describe_io_return(detail, detail_size, "CBI interrupt-IN",
+                           completion_result);
+        return map_io_return(completion_result);
     }
     if (*transferred != (size_t)M65_CBI_STATUS_LENGTH) {
         context->desynchronized = true;
@@ -766,13 +897,24 @@ static M65CbiIoStatus iousbhost_prepare_command_block_reset(
     IousbhostContext *context = (IousbhostContext *)io->context;
     M65IOUSBHostAdapter *adapter = (__bridge M65IOUSBHostAdapter *)context->adapter;
     NSError *error = nil;
+    IOReturn completion_result = kIOReturnSuccess;
+    M65CbiIoStatus drain_status;
     if (!context->open || context->reset_armed) {
         set_detail(detail, detail_size,
                    "CBI command-block reset preparation has invalid state");
         return M65_CBI_IO_PROTOCOL;
     }
-    /* Synchronous transfers leave no request outstanding; clear a possible
-     * interrupt-pipe stall so the reset ADSC and its completion can flow. */
+    /* A timed-out asynchronous completion remains owned by the adapter until
+     * this reset preparation cancels and observes it. Only after that drain
+     * may exactly one reset ADSC be armed. */
+    drain_status = abort_and_drain_interrupt(adapter, &completion_result,
+                                             detail, detail_size);
+    if (drain_status != M65_CBI_IO_OK) {
+        return drain_status;
+    }
+    (void)completion_result;
+    /* Any non-timeout interrupt error halts the pipe; clear the halt and reset
+     * its data toggle before accepting the reset completion request. */
     if (![adapter.pipeIntr clearStallWithError:&error]) {
         IOReturn code = io_return_from_error(error);
         describe_io_return(detail, detail_size,
@@ -813,8 +955,10 @@ static void iousbhost_destroy_io(M65CbiIo *io)
         if (context->adapter != NULL) {
             M65IOUSBHostAdapter *adapter =
                 (__bridge_transfer M65IOUSBHostAdapter *)context->adapter;
-            adapter = nil;
             context->adapter = NULL;
+            /* The bridge transfer balances __bridge_retained from open; ARC
+             * releases the strong local at the end of this scope. */
+            (void)adapter;
         }
         if (context->service != IO_OBJECT_NULL) {
             IOObjectRelease(context->service);

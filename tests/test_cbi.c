@@ -607,6 +607,21 @@ static void test_timeout_and_unplug_propagation(void)
     transport->ops->destroy(transport);
 
     fake_init(&fake);
+    fake.ordinary_interrupt_status = M65_CBI_IO_STALL;
+    transport = opened_transport(&fake);
+    if (transport == NULL) {
+        return;
+    }
+    command = inquiry_command(data, sizeof(data));
+    result = transport->ops->execute(transport, &command);
+    EXPECT_EQ_INT(result.transport_status, M65_TRANSPORT_PROTOCOL);
+    fake.ordinary_interrupt_status = M65_CBI_IO_OK;
+    result = transport->ops->execute(transport, &command);
+    EXPECT_EQ_INT(result.transport_status, M65_TRANSPORT_OK);
+    EXPECT_EQ_U64(count_step(&fake, STEP_PREPARE_RESET), 1U);
+    transport->ops->destroy(transport);
+
+    fake_init(&fake);
     fake.ordinary_bulk_status = M65_CBI_IO_NO_DEVICE;
     transport = opened_transport(&fake);
     if (transport == NULL) {

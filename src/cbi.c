@@ -194,6 +194,15 @@ static M65CbiIoStatus run_exchange(CbiContext *context,
         context->io, exchange->completion, &transferred, timeout_ms,
         detail, detail_size);
     if (status != M65_CBI_IO_OK) {
+        /* Unlike an ADSC or bulk-data STALL, an interrupt-endpoint STALL
+         * prevents completion of the command and leaves the phase unknown.
+         * Require the adapter's cancel/drain/reset path before another CDB. */
+        if (status == M65_CBI_IO_STALL) {
+            set_default_io_detail(detail, detail_size,
+                                  "CBI command-completion interrupt", status);
+            require_recovery(context, detail,
+                             "CBI completion interrupt endpoint stalled");
+        }
         return phase_io_failure(context, status,
                                 "CBI command-completion interrupt",
                                 detail, detail_size);
