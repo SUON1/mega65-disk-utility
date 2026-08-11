@@ -138,10 +138,15 @@ bool m65_cli_parse(int argc, char **argv, M65CliOptions *options,
     }
 
     if (options->command == M65_CLI_DIAGNOSE) {
-        if (options->device != NULL || options->output != NULL ||
-            options->acknowledgement) {
+        if (options->output != NULL || options->acknowledgement) {
             (void)snprintf(detail, detail_size,
-                           "diagnose accepts only --json, --vid, and --pid");
+                           "diagnose accepts only --device, --json, --vid, "
+                           "and --pid");
+            return false;
+        }
+        if (options->device == NULL) {
+            (void)snprintf(detail, detail_size,
+                           "diagnose requires --device <bsd-name>");
             return false;
         }
         return true;
@@ -190,6 +195,6 @@ void m65_cli_usage(const char *program)
         "  %s inspect --device <bsd-name> [--json]\n"
         "  %s test-1581 --device <bsd-name> "
         "--ack-temporary-controller-change [--json] [--output <new-file.d81>]\n"
-        "  %s diagnose [--vid <id>] [--pid <id>] [--json]\n",
+        "  %s diagnose --device <bsd-name> [--vid <id>] [--pid <id>] [--json]\n",
         program, program, program, program);
 }
