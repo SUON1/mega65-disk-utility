@@ -17,6 +17,7 @@ int main(void)
     test_cbi();
     test_cli();
     test_device();
+    test_diagnose();
     test_json();
     test_layout();
     test_ufi();
