@@ -3,8 +3,8 @@
 #include "m65/discovery.h"
 #include "m65/output.h"
 #include "m65/probe.h"
-#include "m65/transport_iousbhost_bridge.h"
 #include "m65/ufi.h"
+#include "m65/usb_cbi_iousbhost_macos.h"
 #include "m65/usb_cbi_macos.h"
 
 #include <errno.h>
@@ -116,194 +116,86 @@ static const char *command_name(M65CliCommand command)
     return "invalid";
 }
 
-#define M65_UFI_BLOCK_LEN 12U
-
 /*
- * diagnose exercises the IOUSBHost whole-device capture path with data-in UFI
- * commands only. It never sends FORMAT UNIT, WRITE, MODE SELECT, or any other
- * data-out opcode. INQUIRY, REQUEST SENSE, READ CAPACITY, and MODE SENSE are
- * all device-to-host transfers.
+ * diagnose runs the full read-only UFI inspection (m65_inspect) over the
+ * IOUSBHost whole-device capture transport bound to the device discovered on
+ * the command line.  The capture transport is created strictly through the
+ * IOUSBHost adapter (no IOUSBLib fallback) because the whole purpose of
+ * diagnose is to exercise the capture path.  All UFI traffic flows through the
+ * CBI/UFI safety engine, so only data-in commands are ever issued.
  */
-static int diagnose_send_in(m65_iousbhost_ctx_t *ctx, const uint8_t *cdb,
-                            uint8_t *data, size_t data_len)
-{
-    uint8_t status[2] = {0U, 0U};
-    (void)memset(data, 0, data_len);
-    return m65_iousbhost_send_ufi(ctx, cdb, (uint8_t)M65_UFI_BLOCK_LEN,
-                                  data, data_len, 1, status);
-}
-
-static int run_diagnose(const M65CliOptions *options)
+static int run_diagnose(const M65CliOptions *options, const M65DeviceInfo *device)
 {
     M65DiagnoseReport report;
-    m65_iousbhost_ctx_t *ctx = NULL;
-    uint8_t cdb[16];
-    uint8_t inquiry[36];
-    uint8_t sense_buf[18];
-    uint8_t capacity[8];
-    uint8_t mode[96];
-    char parse_detail[M65_MAX_ERROR_TEXT] = "";
-    bool human = !options->json;
-    bool ufi_failed = false;
-    int rc;
+    M65Transport *transport;
+    M65TransportStatus create_status = M65_TRANSPORT_OK;
+    char detail[M65_MAX_ERROR_TEXT] = "";
 
     (void)memset(&report, 0, sizeof(report));
     report.vid = options->vid;
     report.pid = options->pid;
 
-    if (human) {
-        (void)printf("diagnose: searching for %04x:%04x class=08/04/00...\n",
-                     (unsigned int)report.vid, (unsigned int)report.pid);
-    }
-
-    rc = m65_iousbhost_open(report.vid, report.pid, &ctx);
-    if (rc != M65_IOUSBHOST_OK) {
-        switch (rc) {
-        case M65_IOUSBHOST_ERR_NOT_FOUND:
-            report.exit_code = 1;
-            (void)snprintf(report.reason, sizeof(report.reason),
-                           "interface service not found in IORegistry");
-            break;
-        case M65_IOUSBHOST_ERR_PIPE:
-            report.exit_code = 3;
-            (void)snprintf(report.reason, sizeof(report.reason),
-                           "endpoint discovery or pipe open failed");
-            break;
-        case M65_IOUSBHOST_ERR_CAPTURE:
-        default:
-            report.exit_code = 2;
-            (void)snprintf(report.reason, sizeof(report.reason),
-                           "IOUSBHost DeviceCapture failed (see stderr for IOReturn)");
-            break;
-        }
-        if (human) {
-            (void)printf("diagnose: %s\n", report.reason);
-        } else {
-            (void)m65_output_diagnose_json(&report);
-        }
-        return report.exit_code;
-    }
-
-    report.captured = true;
-    report.alt_setting_ok = true;
-    if (human) {
-        (void)printf("diagnose: IOUSBHost capture: OK\n");
-        (void)printf("diagnose: endpoints:\n");
-        m65_iousbhost_print_endpoints(ctx);
-        (void)printf("diagnose: selectAlternateSetting 0: OK\n");
-    }
-
-    /* Step 5 — INQUIRY (data-in). Failure here is fatal (exit 4). */
-    (void)m65_cdb_inquiry(cdb, (uint8_t)sizeof(inquiry));
-    if (diagnose_send_in(ctx, cdb, inquiry, sizeof(inquiry)) == M65_IOUSBHOST_OK &&
-        m65_parse_inquiry(inquiry, sizeof(inquiry), &report.inquiry,
-                          parse_detail, sizeof(parse_detail))) {
-        report.inquiry_ok = true;
-        if (human) {
-            (void)printf("diagnose: INQUIRY: vendor=\"%s\" product=\"%s\" rev=\"%s\"\n",
-                         report.inquiry.vendor, report.inquiry.product,
-                         report.inquiry.firmware);
-        }
+    transport = m65_iousbhost_transport_create(device->bsd_name, detail,
+                                               sizeof(detail), &create_status);
+    if (transport == NULL) {
+        report.captured = false;
+        report.destroyed = false;
+        report.exit_code = m65_diagnose_exit_code(false, create_status,
+                                                  M65_PROBE_TRANSPORT);
+        (void)snprintf(report.reason, sizeof(report.reason), "%s",
+                       detail[0] != '\0' ? detail :
+                       "IOUSBHost capture transport could not be created");
     } else {
-        report.exit_code = 4;
-        (void)snprintf(report.reason, sizeof(report.reason),
-                       "INQUIRY failed over IOUSBHost transport");
-        if (human) {
-            (void)fprintf(stderr, "diagnose: INQUIRY failed\n");
-        }
-        goto teardown;
+        report.captured = true;
+        (void)m65_inspect(transport, &report.inspect);
+        transport->ops->destroy(transport);
+        report.destroyed = true;
+        report.exit_code = m65_diagnose_exit_code(true, create_status,
+                                                  report.inspect.code);
+        (void)snprintf(report.reason, sizeof(report.reason), "%s",
+                       report.inspect.reason[0] != '\0' ? report.inspect.reason :
+                       "diagnose completed over IOUSBHost capture transport");
     }
 
-    /* Step 6 — REQUEST SENSE (data-in). Log and continue. */
-    (void)m65_cdb_request_sense(cdb, (uint8_t)sizeof(sense_buf));
-    if (diagnose_send_in(ctx, cdb, sense_buf, sizeof(sense_buf)) == M65_IOUSBHOST_OK &&
-        m65_parse_sense(sense_buf, sizeof(sense_buf), &report.sense)) {
-        report.request_sense_ok = true;
-        if (human) {
-            (void)printf("diagnose: REQUEST SENSE: SK=0x%02x ASC=0x%02x ASCQ=0x%02x%s\n",
-                         (unsigned int)report.sense.key,
-                         (unsigned int)report.sense.asc,
-                         (unsigned int)report.sense.ascq,
-                         (report.sense.key == 0U && report.sense.asc == 0U &&
-                          report.sense.ascq == 0U) ? " (no error)" : "");
-        }
-    } else {
-        ufi_failed = true;
-        if (human) {
-            (void)fprintf(stderr, "diagnose: REQUEST SENSE failed\n");
-        }
-    }
-
-    /* Step 7 — READ CAPACITY (10) (data-in). Log and continue. */
-    (void)m65_cdb_read_capacity_10(cdb);
-    if (diagnose_send_in(ctx, cdb, capacity, sizeof(capacity)) == M65_IOUSBHOST_OK &&
-        m65_parse_read_capacity_10(capacity, sizeof(capacity), &report.capacity,
-                                   parse_detail, sizeof(parse_detail))) {
-        report.read_capacity_ok = true;
-        if (human) {
-            unsigned long long bytes = (unsigned long long)report.capacity.blocks *
-                                       (unsigned long long)report.capacity.block_size;
-            (void)printf("diagnose: READ CAPACITY: lastLBA=%u blockSize=%u "
-                         "(%u sectors / %llu bytes)\n",
-                         (unsigned int)(report.capacity.blocks - 1U),
-                         (unsigned int)report.capacity.block_size,
-                         (unsigned int)report.capacity.blocks, bytes);
-        }
-    } else {
-        ufi_failed = true;
-        if (human) {
-            (void)fprintf(stderr, "diagnose: READ CAPACITY failed\n");
-        }
-    }
-
-    /* Step 8 — MODE SENSE (10) Flexible Disk page 0x05 (data-in). Log and continue. */
-    {
-        M65ModeParameters mode_params;
-        (void)m65_cdb_mode_sense_10(cdb, false, (uint16_t)sizeof(mode));
-        if (diagnose_send_in(ctx, cdb, mode, sizeof(mode)) == M65_IOUSBHOST_OK &&
-            m65_parse_mode_parameters(mode, sizeof(mode), &mode_params,
-                                      parse_detail, sizeof(parse_detail))) {
-            report.mode_sense_ok = true;
-            report.flexible = mode_params.flexible;
-            if (human) {
-                (void)printf("diagnose: MODE SENSE Flexible Disk page:\n");
-                (void)printf("  sectors/track=%u heads=%u tracks=%u data-rate=%u rpm=%u\n",
-                             (unsigned int)report.flexible.sectors_per_track,
-                             (unsigned int)report.flexible.heads,
-                             (unsigned int)report.flexible.cylinders,
-                             (unsigned int)report.flexible.transfer_rate_kbit,
-                             (unsigned int)report.flexible.medium_rotation_rate_rpm);
-            }
-        } else {
-            ufi_failed = true;
-            if (human) {
-                (void)fprintf(stderr, "diagnose: MODE SENSE failed\n");
-            }
-        }
-    }
-
-    if (ufi_failed) {
-        report.exit_code = 4;
-        (void)snprintf(report.reason, sizeof(report.reason),
-                       "at least one data-in UFI command failed over IOUSBHost");
-    }
-
-teardown:
-    /* Step 9 — destroy: resets the device so the mass-storage driver re-registers. */
-    m65_iousbhost_close(ctx);
-    report.destroyed = true;
-    if (human) {
-        (void)printf("diagnose: destroy: OK\n");
-    }
-
-    if (report.exit_code == 0 && report.reason[0] == '\0') {
-        (void)snprintf(report.reason, sizeof(report.reason),
-                       "all diagnose steps completed over IOUSBHost");
-    }
-    if (!human) {
+    if (options->json) {
         (void)m65_output_diagnose_json(&report);
+    } else {
+        m65_output_diagnose_human(&report);
     }
     return report.exit_code;
+}
+
+/*
+ * Create the UFI transport for the selected device, preferring the IOUSBHost
+ * whole-device capture adapter.  Only when the IOUSBHost interface is genuinely
+ * absent (M65_TRANSPORT_NO_DEVICE) do we fall back to the legacy IOUSBLib
+ * (SCSITaskDeviceInterface) path; any other capture failure is reported
+ * honestly rather than downgraded.
+ */
+static M65Transport *create_selected_transport(const char *bsd_name,
+                                               char *detail, size_t detail_size,
+                                               M65TransportStatus *create_status)
+{
+    M65Transport *transport =
+        m65_iousbhost_transport_create(bsd_name, detail, detail_size,
+                                       create_status);
+    if (transport != NULL) {
+        return transport;
+    }
+    if (*create_status == M65_TRANSPORT_NO_DEVICE) {
+        char fallback_detail[M65_MAX_ERROR_TEXT] = "";
+        M65TransportStatus fallback_status = M65_TRANSPORT_OK;
+        M65Transport *fallback =
+            m65_usb_cbi_transport_create(bsd_name, fallback_detail,
+                                         sizeof(fallback_detail),
+                                         &fallback_status);
+        if (fallback != NULL) {
+            return fallback;
+        }
+        *create_status = fallback_status;
+        (void)snprintf(detail, detail_size, "%s", fallback_detail);
+    }
+    return NULL;
 }
 
 static int run_selected(const M65CliOptions *options, const M65DeviceInfo *device)
@@ -312,8 +204,8 @@ static int run_selected(const M65CliOptions *options, const M65DeviceInfo *devic
     M65Transport *transport;
     char detail[M65_MAX_ERROR_TEXT] = "";
     int result_code;
-    transport = m65_usb_cbi_transport_create(device->bsd_name, detail, sizeof(detail),
-                                             &create_status);
+    transport = create_selected_transport(device->bsd_name, detail, sizeof(detail),
+                                           &create_status);
     if (options->command == M65_CLI_INSPECT) {
         M65InspectReport report;
         (void)memset(&report, 0, sizeof(report));
@@ -389,9 +281,6 @@ int main(int argc, char **argv)
         }
         return 64;
     }
-    if (options.command == M65_CLI_DIAGNOSE) {
-        return run_diagnose(&options);
-    }
     if (!m65_discover_devices(&devices, detail, sizeof(detail))) {
         if (options.json) {
             (void)m65_output_error_json(
@@ -437,6 +326,9 @@ int main(int argc, char **argv)
                           selected->bsd_name, detail);
         }
         return 2;
+    }
+    if (options.command == M65_CLI_DIAGNOSE) {
+        return run_diagnose(&options, selected);
     }
     return run_selected(&options, selected);
 }
