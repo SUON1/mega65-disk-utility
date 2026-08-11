@@ -18,6 +18,8 @@ typedef struct {
     M65FormatCapacities format_capacities;
     M65ModeParameters current_mode;
     M65ModeParameters changeable_mode;
+    bool exclusive_acquired;
+    bool exclusive_released;
 } M65InspectReport;
 
 typedef enum {
@@ -37,6 +39,7 @@ typedef struct {
     M65FlexibleDiskPage accepted;
     bool acknowledgement_supplied;
     bool exclusive_acquired;
+    bool exclusive_released;
     bool original_saved;
     bool controller_changed;
     bool controller_restored;

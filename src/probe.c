@@ -145,7 +145,6 @@ M65ProbeCode m65_inspect(M65Transport *transport, M65InspectReport *report)
     }
     (void)memset(report, 0, sizeof(*report));
     report->code = M65_PROBE_TRANSPORT;
-    m65_probe_clear_interrupt();
 
     acquire_status = transport->ops->acquire_exclusive(transport, report->reason,
                                                         sizeof(report->reason));
@@ -157,6 +156,7 @@ M65ProbeCode m65_inspect(M65Transport *transport, M65InspectReport *report)
         return report->code;
     }
     acquired = true;
+    report->exclusive_acquired = true;
 
     (void)memset(inquiry, 0, sizeof(inquiry));
     if (!inspect_input(transport, report, "INQUIRY", cdb,
@@ -247,6 +247,8 @@ cleanup:
             if (report->code == M65_PROBE_OK) {
                 report->code = code_for_transport(release_status);
             }
+        } else {
+            report->exclusive_released = true;
         }
     }
     return report->code;
@@ -368,7 +370,6 @@ M65ProbeCode m65_test_1581(M65Transport *transport, bool acknowledgement,
     report->status = M65_1581_INCONCLUSIVE;
     report->code = M65_PROBE_TRANSPORT;
     report->acknowledgement_supplied = acknowledgement;
-    m65_probe_clear_interrupt();
 
     if (!acknowledgement) {
         report->code = M65_PROBE_USAGE;
@@ -541,8 +542,9 @@ cleanup:
             report->code = M65_PROBE_TRANSPORT;
         }
         report->status = M65_1581_INCONCLUSIVE;
+    } else {
+        report->exclusive_released = true;
     }
-    report->exclusive_acquired = false;
 
     if (report->status != M65_1581_SUPPORTED) {
         free(report->image);

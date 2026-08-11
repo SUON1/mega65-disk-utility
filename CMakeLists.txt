@@ -70,6 +70,7 @@ m65_sanitizers(m65floppy-probe)
 include(CTest)
 if(BUILD_TESTING)
   add_executable(m65-unit-tests
+    src/output.c
     tests/fake_transport.c
     tests/test_bytes.c
     tests/test_cbi.c
@@ -79,6 +80,7 @@ if(BUILD_TESTING)
     tests/test_json.c
     tests/test_layout.c
     tests/test_main.c
+    tests/test_output.c
     tests/test_probe.c
     tests/test_ufi.c
   )

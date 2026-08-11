@@ -118,6 +118,31 @@ static void json_flexible(M65Json *json, const M65FlexibleDiskPage *page,
     (void)m65_json_end_object(json);
 }
 
+static void flexible_page_hex(const M65FlexibleDiskPage *page,
+                              char hex[(M65_FLEX_PAGE_LENGTH * 2U) + 1U])
+{
+    static const char digits[] = "0123456789abcdef";
+    size_t index;
+    for (index = 0U; index < M65_FLEX_PAGE_LENGTH; ++index) {
+        hex[index * 2U] = digits[page->page[index] >> 4U];
+        hex[index * 2U + 1U] = digits[page->page[index] & 0x0fU];
+    }
+    hex[M65_FLEX_PAGE_LENGTH * 2U] = '\0';
+}
+
+static void json_flexible_mask(M65Json *json,
+                               const M65FlexibleDiskPage *page)
+{
+    char raw_hex[(M65_FLEX_PAGE_LENGTH * 2U) + 1U];
+    flexible_page_hex(page, raw_hex);
+    (void)m65_json_begin_object(json);
+    (void)m65_json_key(json, "page_code");
+    (void)m65_json_uint(json, page->page[0] & 0x3fU);
+    (void)m65_json_key(json, "raw_hex");
+    (void)m65_json_string(json, raw_hex);
+    (void)m65_json_end_object(json);
+}
+
 static void json_errors(M65Json *json, const char *error, const M65Sense *sense)
 {
     (void)m65_json_key(json, "errors");
@@ -324,8 +349,8 @@ static void json_inspect_ufi_body(M65Json *json, const M65InspectReport *report)
     (void)m65_json_end_array(json);
     (void)m65_json_key(json, "flexible_disk");
     json_flexible(json, &report->current_mode.flexible, true);
-    (void)m65_json_key(json, "changeable_flexible_disk");
-    json_flexible(json, &report->changeable_mode.flexible, true);
+    (void)m65_json_key(json, "flexible_disk_changeable_mask");
+    json_flexible_mask(json, &report->changeable_mode.flexible);
     (void)m65_json_key(json, "sense");
     json_sense(json, &report->sense);
 }
@@ -345,6 +370,15 @@ bool m65_output_inspect_json(const M65DeviceInfo *device,
     (void)m65_json_key(&json, "media");
     (void)m65_json_begin_object(&json);
     json_media_fields(&json, device);
+    (void)m65_json_end_object(&json);
+    (void)m65_json_key(&json, "transport");
+    (void)m65_json_begin_object(&json);
+    (void)m65_json_key(&json, "backend");
+    (void)m65_json_string(&json, "iousbhost");
+    (void)m65_json_key(&json, "capture_acquired");
+    (void)m65_json_bool(&json, report->exclusive_acquired);
+    (void)m65_json_key(&json, "capture_released");
+    (void)m65_json_bool(&json, report->exclusive_released);
     (void)m65_json_end_object(&json);
     (void)m65_json_key(&json, "ufi");
     (void)m65_json_begin_object(&json);
@@ -367,7 +401,12 @@ void m65_output_inspect_human(const M65DeviceInfo *device,
 {
     size_t index;
     size_t field;
+    char raw_hex[(M65_FLEX_PAGE_LENGTH * 2U) + 1U];
+    flexible_page_hex(&report->changeable_mode.flexible, raw_hex);
     (void)printf("Device: %s\n", device->bsd_name);
+    (void)printf("Transport: iousbhost; capture acquired: %s; released: %s\n",
+                 report->exclusive_acquired ? "yes" : "no",
+                 report->exclusive_released ? "yes" : "no");
     (void)printf("INQUIRY: vendor \"%s\", product \"%s\", firmware \"%s\"\n",
                  report->inquiry.vendor, report->inquiry.product,
                  report->inquiry.firmware);
@@ -386,6 +425,8 @@ void m65_output_inspect_human(const M65DeviceInfo *device,
                      (unsigned int)descriptor->block_size,
                      (unsigned int)descriptor->descriptor_code);
     }
+    (void)printf("Flexible Disk changeable mask: page 0x%02x, raw %s\n",
+                 report->changeable_mode.flexible.page[0] & 0x3fU, raw_hex);
     (void)printf(
         "Flexible Disk: %u kbit/s, %u heads, %u sectors/track, "
         "%u bytes/sector, %u cylinders, %u RPM\n",
@@ -424,6 +465,15 @@ bool m65_output_1581_json(const M65DeviceInfo *device,
     (void)m65_json_key(&json, "media");
     (void)m65_json_begin_object(&json);
     json_media_fields(&json, device);
+    (void)m65_json_end_object(&json);
+    (void)m65_json_key(&json, "transport");
+    (void)m65_json_begin_object(&json);
+    (void)m65_json_key(&json, "backend");
+    (void)m65_json_string(&json, "iousbhost");
+    (void)m65_json_key(&json, "capture_acquired");
+    (void)m65_json_bool(&json, report->exclusive_acquired);
+    (void)m65_json_key(&json, "capture_released");
+    (void)m65_json_bool(&json, report->exclusive_released);
     (void)m65_json_end_object(&json);
     (void)m65_json_key(&json, "ufi");
     (void)m65_json_begin_object(&json);
@@ -471,6 +521,9 @@ void m65_output_1581_human(const M65DeviceInfo *device,
                            const char *output_path)
 {
     (void)printf("Device: %s\n", device->bsd_name);
+    (void)printf("Transport: iousbhost; capture acquired: %s; released: %s\n",
+                 report->exclusive_acquired ? "yes" : "no",
+                 report->exclusive_released ? "yes" : "no");
     (void)printf("1581 geometry result: %s\n", m65_1581_status_text(report->status));
     (void)printf("Reason: %s\n", report->reason);
     (void)printf("Original parameters saved: %s\n",
@@ -501,21 +554,31 @@ bool m65_output_diagnose_json(const M65DiagnoseReport *report)
     if (!json_top(&json, "diagnose")) {
         return false;
     }
+    (void)m65_json_key(&json, "device");
+    (void)m65_json_begin_object(&json);
+    json_device_fields(&json, &report->device);
+    (void)m65_json_end_object(&json);
+    (void)m65_json_key(&json, "media");
+    (void)m65_json_begin_object(&json);
+    json_media_fields(&json, &report->device);
+    (void)m65_json_end_object(&json);
     (void)m65_json_key(&json, "diagnose");
     (void)m65_json_begin_object(&json);
-    (void)m65_json_key(&json, "transport");
+    (void)m65_json_key(&json, "backend");
     (void)m65_json_string(&json, "iousbhost");
-    (void)m65_json_key(&json, "vid");
-    json_identifier(&json, report->vid);
-    (void)m65_json_key(&json, "pid");
-    json_identifier(&json, report->pid);
-    (void)m65_json_key(&json, "capture");
-    (void)m65_json_bool(&json, report->captured);
-    (void)m65_json_key(&json, "destroy");
-    (void)m65_json_bool(&json, report->destroyed);
+    (void)m65_json_key(&json, "transport_created");
+    (void)m65_json_bool(&json, report->transport_created);
+    (void)m65_json_key(&json, "capture_acquired");
+    (void)m65_json_bool(&json, report->capture_acquired);
+    (void)m65_json_key(&json, "capture_released");
+    (void)m65_json_bool(&json, report->capture_released);
+    (void)m65_json_key(&json, "destroy_called");
+    (void)m65_json_bool(&json, report->destroy_called);
+    (void)m65_json_key(&json, "driver_media_rematch");
+    (void)m65_json_string(&json, "unverified");
     (void)m65_json_key(&json, "ufi");
     (void)m65_json_begin_object(&json);
-    if (report->captured) {
+    if (report->capture_acquired) {
         json_inspect_ufi_body(&json, inspect);
     }
     (void)m65_json_end_object(&json);
@@ -540,12 +603,18 @@ void m65_output_diagnose_human(const M65DiagnoseReport *report)
     const M65InspectReport *inspect = &report->inspect;
     size_t index;
     size_t field;
+    char raw_hex[(M65_FLEX_PAGE_LENGTH * 2U) + 1U];
+    flexible_page_hex(&inspect->changeable_mode.flexible, raw_hex);
     (void)printf("diagnose (IOUSBHost whole-device capture)\n");
+    (void)printf("Device: %s\n", report->device.bsd_name);
     (void)printf("USB identity: VID 0x%04x, PID 0x%04x\n",
-                 (unsigned int)report->vid, (unsigned int)report->pid);
-    (void)printf("Capture transport created: %s\n",
-                 report->captured ? "yes" : "no");
-    if (report->captured) {
+                 (unsigned int)report->device.usb_vid,
+                 (unsigned int)report->device.usb_pid);
+    (void)printf("Transport created: %s\n",
+                 report->transport_created ? "yes" : "no");
+    (void)printf("Capture acquired: %s\n",
+                 report->capture_acquired ? "yes" : "no");
+    if (report->capture_acquired) {
         (void)printf("INQUIRY: vendor \"%s\", product \"%s\", firmware \"%s\"\n",
                      inspect->inquiry.vendor, inspect->inquiry.product,
                      inspect->inquiry.firmware);
@@ -576,20 +645,26 @@ void m65_output_diagnose_human(const M65DiagnoseReport *report)
             (unsigned int)inspect->current_mode.flexible.medium_rotation_rate_rpm);
         (void)printf("MODE SENSE changeable fields:");
         for (field = 0U; field < (size_t)M65_FLEX_FIELD_COUNT; ++field) {
-            if (inspect->changeable_mode.flexible.field_changeable[field]) {
+            if (inspect->current_mode.flexible.field_changeable[field]) {
                 (void)printf(" %s",
                     m65_flexible_field_name((M65FlexibleField)field));
             }
         }
         (void)printf("\n");
+        (void)printf("MODE SENSE changeable mask: page 0x%02x, raw %s\n",
+                     inspect->changeable_mode.flexible.page[0] & 0x3fU,
+                     raw_hex);
         if (inspect->sense.valid) {
             (void)printf("REQUEST SENSE: key 0x%02x, ASC 0x%02x, ASCQ 0x%02x\n",
                          inspect->sense.key, inspect->sense.asc,
                          inspect->sense.ascq);
         }
     }
-    (void)printf("Capture transport destroyed: %s\n",
-                 report->destroyed ? "yes" : "no");
+    (void)printf("Capture released: %s\n",
+                 report->capture_released ? "yes" : "no");
+    (void)printf("Transport destroy called: %s\n",
+                 report->destroy_called ? "yes" : "no");
+    (void)printf("Driver/media rematch: unverified; run list after exit\n");
     (void)printf("Result: %s\n", report->reason);
     (void)printf("Exit code: %d\n", report->exit_code);
 }

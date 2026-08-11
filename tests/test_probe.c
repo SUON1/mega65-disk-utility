@@ -23,6 +23,8 @@ static void test_inspect_success(void)
     EXPECT_EQ_U64(report.format_capacities.count, 2U);
     EXPECT_STREQ(report.inquiry.vendor, "TEAC");
     EXPECT_TRUE(report.current_mode.flexible.field_changeable[M65_FLEX_TRANSFER_RATE]);
+    EXPECT_TRUE(report.exclusive_acquired);
+    EXPECT_TRUE(report.exclusive_released);
     expect_cleanup(&fake, true);
 }
 
@@ -49,6 +51,8 @@ static void test_supported(void)
     EXPECT_TRUE(report.boundary_lba_9_read);
     EXPECT_TRUE(report.boundary_lba_1599_read);
     EXPECT_TRUE(report.repeated_reads_match);
+    EXPECT_TRUE(report.exclusive_acquired);
+    EXPECT_TRUE(report.exclusive_released);
     EXPECT_EQ_U64(report.image_length, M65_1581_IMAGE_SIZE);
     EXPECT_EQ_U64(fake.mode_select_count, 2U);
     expect_cleanup(&fake, true);
@@ -82,11 +86,20 @@ static void test_permission_denied(void)
 {
     FakeTransport fake;
     M651581Report report;
+    M65InspectReport inspect;
+    fake_transport_init(&fake);
+    fake.acquire_status = M65_TRANSPORT_PERMISSION;
+    EXPECT_EQ_INT(m65_inspect(&fake.transport, &inspect), M65_PROBE_PERMISSION);
+    EXPECT_FALSE(inspect.exclusive_acquired);
+    EXPECT_FALSE(inspect.exclusive_released);
+
     fake_transport_init(&fake);
     fake.acquire_status = M65_TRANSPORT_PERMISSION;
     EXPECT_EQ_INT(m65_test_1581(&fake.transport, true, &report),
                   M65_PROBE_PERMISSION);
     EXPECT_EQ_U64(fake.release_count, 0U);
+    EXPECT_FALSE(report.exclusive_acquired);
+    EXPECT_FALSE(report.exclusive_released);
     EXPECT_FALSE(report.exclusive_acquired);
     m65_1581_report_destroy(&report);
 }
@@ -169,6 +182,8 @@ static void test_release_failure(void)
     EXPECT_EQ_INT(m65_test_1581(&fake.transport, true, &report),
                   M65_PROBE_TRANSPORT);
     EXPECT_EQ_INT(report.status, M65_1581_INCONCLUSIVE);
+    EXPECT_TRUE(report.exclusive_acquired);
+    EXPECT_FALSE(report.exclusive_released);
     EXPECT_EQ_U64(fake.release_count, 1U);
     EXPECT_TRUE(fake_transport_is_restored(&fake));
     m65_1581_report_destroy(&report);

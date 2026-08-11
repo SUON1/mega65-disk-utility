@@ -218,6 +218,7 @@ void fake_transport_set_all_geometry_changeable(FakeTransport *fake, bool change
 void fake_transport_init(FakeTransport *fake)
 {
     M65FlexibleDiskPage page;
+    m65_probe_clear_interrupt();
     (void)memset(fake, 0, sizeof(*fake));
     fake->transport.ops = &fake_ops;
     fake->transport.context = fake;

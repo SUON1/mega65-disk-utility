@@ -28,14 +28,15 @@ void m65_output_1581_human(const M65DeviceInfo *device,
  * IOUSBHost capture transport, then runs the same read-only UFI inspection
  * (m65_inspect) that the inspect command uses.  All UFI traffic flows through
  * the CBI/UFI safety engine, so the staged results are captured verbatim in the
- * embedded M65InspectReport.  captured records that the capture transport was
- * created; destroyed records that it was torn down cleanly afterwards.
+ * embedded M65InspectReport. Transport construction, capture, release, and the
+ * void destroy call are reported separately; destroy is not rematch proof.
  */
 typedef struct {
-    uint16_t vid;
-    uint16_t pid;
-    bool captured;
-    bool destroyed;
+    M65DeviceInfo device;
+    bool transport_created;
+    bool capture_acquired;
+    bool capture_released;
+    bool destroy_called;
     M65InspectReport inspect;
     int exit_code;
     char reason[M65_MAX_ERROR_TEXT];

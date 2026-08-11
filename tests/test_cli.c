@@ -13,12 +13,13 @@ void test_cli(void)
                          "--ack-temporary-controller-change", "--output", "new.d81",
                          "--json"};
     char *diagnose_missing_device[] = {"probe", "diagnose", "--json"};
-    char *diagnose_args[] = {"probe", "diagnose", "--device", "disk4",
-                             "--vid", "0x0644", "--pid", "0x0000", "--json"};
+    char *diagnose_args[] = {"probe", "diagnose", "--device", "disk4", "--json"};
     char *diagnose_reject_output[] = {"probe", "diagnose", "--device", "disk4",
                                       "--output", "new.d81"};
     char *diagnose_reject_ack[] = {"probe", "diagnose", "--device", "disk4",
                                    "--ack-temporary-controller-change"};
+    char *diagnose_reject_vid[] = {"probe", "diagnose", "--device", "disk4",
+                                   "--vid", "0x0644"};
     char *inspect_reject_vid[] = {"probe", "inspect", "--device", "disk4",
                                   "--vid", "0x0644"};
     EXPECT_TRUE(m65_cli_parse(3, list_args, &options, detail, sizeof(detail)));
@@ -40,12 +41,10 @@ void test_cli(void)
                                sizeof(detail)));
     EXPECT_TRUE(strstr(detail, "--device") != NULL);
 
-    /* diagnose accepts --device plus optional --vid/--pid/--json. */
-    EXPECT_TRUE(m65_cli_parse(9, diagnose_args, &options, detail, sizeof(detail)));
+    /* Identity comes from discovery; diagnose accepts --device and --json. */
+    EXPECT_TRUE(m65_cli_parse(5, diagnose_args, &options, detail, sizeof(detail)));
     EXPECT_EQ_INT(options.command, M65_CLI_DIAGNOSE);
     EXPECT_STREQ(options.device, "disk4");
-    EXPECT_EQ_INT(options.vid, 0x0644);
-    EXPECT_EQ_INT(options.pid, 0x0000);
     EXPECT_TRUE(options.json);
 
     /* diagnose is strictly read-only: --output and the ack flag are rejected. */
@@ -53,8 +52,10 @@ void test_cli(void)
                                sizeof(detail)));
     EXPECT_FALSE(m65_cli_parse(5, diagnose_reject_ack, &options, detail,
                                sizeof(detail)));
+    EXPECT_FALSE(m65_cli_parse(6, diagnose_reject_vid, &options, detail,
+                               sizeof(detail)));
 
-    /* --vid/--pid remain diagnose-only for the other commands. */
+    /* Display-only VID/PID overrides are rejected for every command. */
     EXPECT_FALSE(m65_cli_parse(6, inspect_reject_vid, &options, detail,
                                sizeof(detail)));
     EXPECT_TRUE(strstr(detail, "--vid") != NULL);

@@ -5,7 +5,6 @@
 #include "m65/probe.h"
 #include "m65/ufi.h"
 #include "m65/usb_cbi_iousbhost_macos.h"
-#include "m65/usb_cbi_macos.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -50,6 +49,94 @@ static void signal_handler(int signal_number)
 {
     (void)signal_number;
     m65_probe_request_interrupt();
+}
+
+typedef struct {
+    struct sigaction previous_int;
+    struct sigaction previous_term;
+    sigset_t previous_mask;
+    bool int_installed;
+    bool term_installed;
+    bool active;
+} SignalGuard;
+
+static bool install_signal_guard(SignalGuard *guard,
+                                 char *detail, size_t detail_size)
+{
+    struct sigaction action;
+    sigset_t blocked;
+    int saved_errno;
+
+    (void)memset(guard, 0, sizeof(*guard));
+    (void)sigemptyset(&blocked);
+    (void)sigaddset(&blocked, SIGINT);
+    (void)sigaddset(&blocked, SIGTERM);
+    if (sigprocmask(SIG_BLOCK, &blocked, &guard->previous_mask) != 0) {
+        (void)snprintf(detail, detail_size,
+                       "cannot block interruption signals: %s", strerror(errno));
+        return false;
+    }
+
+    m65_probe_clear_interrupt();
+    (void)memset(&action, 0, sizeof(action));
+    action.sa_handler = signal_handler;
+    (void)sigemptyset(&action.sa_mask);
+    if (sigaction(SIGINT, &action, &guard->previous_int) == 0) {
+        guard->int_installed = true;
+    } else {
+        saved_errno = errno;
+        (void)sigprocmask(SIG_SETMASK, &guard->previous_mask, NULL);
+        (void)snprintf(detail, detail_size,
+                       "cannot install SIGINT cleanup handler: %s",
+                       strerror(saved_errno));
+        return false;
+    }
+    if (sigaction(SIGTERM, &action, &guard->previous_term) == 0) {
+        guard->term_installed = true;
+    } else {
+        saved_errno = errno;
+        (void)sigaction(SIGINT, &guard->previous_int, NULL);
+        guard->int_installed = false;
+        (void)sigprocmask(SIG_SETMASK, &guard->previous_mask, NULL);
+        (void)snprintf(detail, detail_size,
+                       "cannot install SIGTERM cleanup handler: %s",
+                       strerror(saved_errno));
+        return false;
+    }
+    if (sigprocmask(SIG_SETMASK, &guard->previous_mask, NULL) != 0) {
+        saved_errno = errno;
+        (void)sigaction(SIGTERM, &guard->previous_term, NULL);
+        (void)sigaction(SIGINT, &guard->previous_int, NULL);
+        guard->int_installed = false;
+        guard->term_installed = false;
+        (void)snprintf(detail, detail_size,
+                       "cannot restore signal mask after installing cleanup handlers: %s",
+                       strerror(saved_errno));
+        return false;
+    }
+    guard->active = true;
+    return true;
+}
+
+static void restore_signal_guard(SignalGuard *guard)
+{
+    sigset_t blocked;
+    sigset_t ignored_mask;
+    if (!guard->active) {
+        return;
+    }
+    (void)sigemptyset(&blocked);
+    (void)sigaddset(&blocked, SIGINT);
+    (void)sigaddset(&blocked, SIGTERM);
+    (void)sigprocmask(SIG_BLOCK, &blocked, &ignored_mask);
+    if (guard->term_installed) {
+        (void)sigaction(SIGTERM, &guard->previous_term, NULL);
+    }
+    if (guard->int_installed) {
+        (void)sigaction(SIGINT, &guard->previous_int, NULL);
+    }
+    (void)sigprocmask(SIG_SETMASK, &guard->previous_mask, NULL);
+    guard->active = false;
 }
 
 static bool forbidden_output_path(const char *path)
@@ -130,26 +217,34 @@ static int run_diagnose(const M65CliOptions *options, const M65DeviceInfo *devic
     M65Transport *transport;
     M65TransportStatus create_status = M65_TRANSPORT_OK;
     char detail[M65_MAX_ERROR_TEXT] = "";
+    SignalGuard signals;
 
     (void)memset(&report, 0, sizeof(report));
-    report.vid = options->vid;
-    report.pid = options->pid;
+    report.device = *device;
+    (void)memset(&signals, 0, sizeof(signals));
 
     transport = m65_iousbhost_transport_create(device->bsd_name, detail,
                                                sizeof(detail), &create_status);
     if (transport == NULL) {
-        report.captured = false;
-        report.destroyed = false;
         report.exit_code = m65_diagnose_exit_code(false, create_status,
                                                   M65_PROBE_TRANSPORT);
         (void)snprintf(report.reason, sizeof(report.reason), "%s",
                        detail[0] != '\0' ? detail :
                        "IOUSBHost capture transport could not be created");
     } else {
-        report.captured = true;
-        (void)m65_inspect(transport, &report.inspect);
+        report.transport_created = true;
+        if (install_signal_guard(&signals, detail, sizeof(detail))) {
+            (void)m65_inspect(transport, &report.inspect);
+            report.capture_acquired = report.inspect.exclusive_acquired;
+            report.capture_released = report.inspect.exclusive_released;
+        } else {
+            report.inspect.code = M65_PROBE_TRANSPORT;
+            (void)snprintf(report.inspect.reason,
+                           sizeof(report.inspect.reason), "%s", detail);
+        }
         transport->ops->destroy(transport);
-        report.destroyed = true;
+        report.destroy_called = true;
+        restore_signal_guard(&signals);
         report.exit_code = m65_diagnose_exit_code(true, create_status,
                                                   report.inspect.code);
         (void)snprintf(report.reason, sizeof(report.reason), "%s",
@@ -166,36 +261,16 @@ static int run_diagnose(const M65CliOptions *options, const M65DeviceInfo *devic
 }
 
 /*
- * Create the UFI transport for the selected device, preferring the IOUSBHost
- * whole-device capture adapter.  Only when the IOUSBHost interface is genuinely
- * absent (M65_TRANSPORT_NO_DEVICE) do we fall back to the legacy IOUSBLib
- * (SCSITaskDeviceInterface) path; any other capture failure is reported
- * honestly rather than downgraded.
+ * Phase 2 gates are IOUSBHost-only. The legacy IOUSBLib implementation remains
+ * in the repository as prior evidence, but no command silently falls back to
+ * it and therefore no fallback traffic can satisfy an IOUSBHost gate.
  */
 static M65Transport *create_selected_transport(const char *bsd_name,
                                                char *detail, size_t detail_size,
                                                M65TransportStatus *create_status)
 {
-    M65Transport *transport =
-        m65_iousbhost_transport_create(bsd_name, detail, detail_size,
-                                       create_status);
-    if (transport != NULL) {
-        return transport;
-    }
-    if (*create_status == M65_TRANSPORT_NO_DEVICE) {
-        char fallback_detail[M65_MAX_ERROR_TEXT] = "";
-        M65TransportStatus fallback_status = M65_TRANSPORT_OK;
-        M65Transport *fallback =
-            m65_usb_cbi_transport_create(bsd_name, fallback_detail,
-                                         sizeof(fallback_detail),
-                                         &fallback_status);
-        if (fallback != NULL) {
-            return fallback;
-        }
-        *create_status = fallback_status;
-        (void)snprintf(detail, detail_size, "%s", fallback_detail);
-    }
-    return NULL;
+    return m65_iousbhost_transport_create(bsd_name, detail, detail_size,
+                                          create_status);
 }
 
 static int run_selected(const M65CliOptions *options, const M65DeviceInfo *device)
@@ -204,6 +279,8 @@ static int run_selected(const M65CliOptions *options, const M65DeviceInfo *devic
     M65Transport *transport;
     char detail[M65_MAX_ERROR_TEXT] = "";
     int result_code;
+    SignalGuard signals;
+    (void)memset(&signals, 0, sizeof(signals));
     transport = create_selected_transport(device->bsd_name, detail, sizeof(detail),
                                            &create_status);
     if (options->command == M65_CLI_INSPECT) {
@@ -216,8 +293,14 @@ static int run_selected(const M65CliOptions *options, const M65DeviceInfo *devic
                            M65_PROBE_NO_DEVICE : M65_PROBE_TRANSPORT);
             (void)snprintf(report.reason, sizeof(report.reason), "%s", detail);
         } else {
-            (void)m65_inspect(transport, &report);
+            if (install_signal_guard(&signals, detail, sizeof(detail))) {
+                (void)m65_inspect(transport, &report);
+            } else {
+                report.code = M65_PROBE_TRANSPORT;
+                (void)snprintf(report.reason, sizeof(report.reason), "%s", detail);
+            }
             transport->ops->destroy(transport);
+            restore_signal_guard(&signals);
         }
         if (options->json) {
             (void)m65_output_inspect_json(device, &report);
@@ -237,12 +320,15 @@ static int run_selected(const M65CliOptions *options, const M65DeviceInfo *devic
                            M65_PROBE_NO_DEVICE : M65_PROBE_TRANSPORT);
             (void)snprintf(report.reason, sizeof(report.reason), "%s", detail);
         } else {
-            (void)signal(SIGINT, signal_handler);
-            (void)signal(SIGTERM, signal_handler);
-            (void)m65_test_1581(transport, options->acknowledgement, &report);
+            if (install_signal_guard(&signals, detail, sizeof(detail))) {
+                (void)m65_test_1581(transport, options->acknowledgement, &report);
+            } else {
+                report.code = M65_PROBE_TRANSPORT;
+                report.status = M65_1581_INCONCLUSIVE;
+                (void)snprintf(report.reason, sizeof(report.reason), "%s", detail);
+            }
             transport->ops->destroy(transport);
-            (void)signal(SIGINT, SIG_DFL);
-            (void)signal(SIGTERM, SIG_DFL);
+            restore_signal_guard(&signals);
         }
         if (report.code == M65_PROBE_OK && options->output != NULL &&
             !write_new_image(options->output, report.image, report.image_length,
