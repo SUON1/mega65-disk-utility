@@ -75,6 +75,7 @@ if(BUILD_TESTING)
     tests/test_cbi.c
     tests/test_cli.c
     tests/test_device.c
+    tests/test_diagnose.c
     tests/test_json.c
     tests/test_layout.c
     tests/test_main.c
@@ -94,41 +95,39 @@ if(BUILD_TESTING)
 endif()
 
 # ---------------------------------------------------------------------------
-# Phase 2: IOUSBHost capture transport
+# Phase 2: IOUSBHost whole-device capture transport
 # ---------------------------------------------------------------------------
+# The IOUSBHost adapter (src/usb_cbi_iousbhost_macos.m) is an Objective-C (ARC)
+# translation unit that implements the low-level M65CbiIo operation table on top
+# of IOUSBHost.framework and hands it to the shared, unit-tested CBI/UFI engine
+# in src/cbi.c.  Its factory symbol m65_iousbhost_transport_create() is used
+# ONLY by the executable (src/main.c), which links m65mac.  Neither m65core nor
+# the unit-test binary references it, so no stub is linked into the tests.
 if(APPLE)
-  # The bridge is Objective-C (ARC); enable the language so CMake compiles the
-  # .m source.  The project is otherwise pure C.
+  # Enable Objective-C so CMake compiles the .m source; the project is
+  # otherwise pure C.
   enable_language(OBJC)
 
-  # Compile the Objective-C bridge into the macOS backend library only.
   target_sources(m65mac PRIVATE
-    src/transport_iousbhost.m
+    src/usb_cbi_iousbhost_macos.m
   )
-  set_source_files_properties(src/transport_iousbhost.m
-    PROPERTIES COMPILE_FLAGS "-fobjc-arc"
+  # -fobjc-arc: automatic reference counting for the adapter's ObjC objects.
+  # -fmodules: required so the `@import Foundation;` / `@import IOUSBHost;`
+  # module imports in the .m resolve (they fail with modules disabled).
+  set_source_files_properties(src/usb_cbi_iousbhost_macos.m
+    PROPERTIES COMPILE_FLAGS "-fobjc-arc -fmodules"
   )
   target_link_libraries(m65mac PRIVATE
     "-framework IOUSBHost"
     "-framework Foundation"
   )
-
-  # probe.c lives in m65core and references the IOUSBHost bridge symbols under
-  # #if defined(__APPLE__).  The executable resolves them via the .m compiled
-  # into m65mac.  The unit-test binary, however, links m65core WITHOUT m65mac,
-  # so it would fail to link with "undefined symbol" for the bridge functions.
-  # Add the no-op stub to the unit-test target ONLY (never to m65core, which
-  # would collide with the real .m definitions in the executable link).
-  if(TARGET m65-unit-tests)
-    target_sources(m65-unit-tests PRIVATE
-      src/transport_iousbhost_stubs.c
-    )
-  endif()
 endif()
 
-# Stub included for non-Apple (Linux/Windows) builds, where the .m is absent.
+# Stub factory for non-Apple (Linux/Windows) builds, where IOUSBHost is absent.
+# (This project currently FATAL_ERRORs on non-Apple above; the stub keeps the
+# link self-consistent should that guard ever be relaxed.)
 if(NOT APPLE)
-  target_sources(m65core PRIVATE
-    src/transport_iousbhost_stubs.c
+  target_sources(m65mac PRIVATE
+    src/usb_cbi_iousbhost_stubs.c
   )
 endif()
