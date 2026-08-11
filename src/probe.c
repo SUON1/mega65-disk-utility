@@ -5,10 +5,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if defined(__APPLE__)
-#include "m65/transport_iousbhost_bridge.h"
-#endif
-
 #define M65_SCSI_STATUS_GOOD 0x00U
 #define M65_IO_TIMEOUT_MS 15000U
 #define M65_READ_CHUNK_BLOCKS 10U
@@ -364,9 +360,6 @@ M65ProbeCode m65_test_1581(M65Transport *transport, bool acknowledgement,
     uint8_t *second_image = NULL;
     char cleanup_detail[M65_MAX_ERROR_TEXT] = "";
     bool restore_needed = false;
-#if defined(__APPLE__)
-    m65_iousbhost_ctx_t *iousbhost_ctx = NULL;
-#endif
 
     if (report == NULL) {
         return M65_PROBE_TRANSPORT;
@@ -387,30 +380,6 @@ M65ProbeCode m65_test_1581(M65Transport *transport, bool acknowledgement,
         reason_set(report->reason, "no transport was provided");
         return report->code;
     }
-
-#if defined(__APPLE__)
-    /*
-     * Phase 2: prefer the IOUSBHost whole-device capture transport on macOS.
-     * The capture context is opened here so the driver is detached before the
-     * MODE SELECT / LBA-1599 sequence runs.  UFI commands still flow through
-     * the provided M65Transport vtable (the existing IOUSBLib path) until the
-     * capture transport is bound to the vtable in a later step; opening the
-     * context first guarantees exclusive ownership of the device.  On any
-     * failure we log and fall back to the IOUSBLib path already wired below.
-     */
-    {
-        int iousbhost_rc = m65_iousbhost_open(0x0644, 0x0000, &iousbhost_ctx);
-        if (iousbhost_rc == M65_IOUSBHOST_OK) {
-            /* Capture succeeded; context retained for the sequence below. */
-        } else if (iousbhost_rc == M65_IOUSBHOST_ERR_NOT_FOUND) {
-            fprintf(stderr, "test-1581: IOUSBHost not available, "
-                            "falling back to IOUSBLib\n");
-        } else {
-            fprintf(stderr, "test-1581: IOUSBHost capture failed (rc=%d), "
-                            "falling back to IOUSBLib\n", iousbhost_rc);
-        }
-    }
-#endif
 
     transport_status = transport->ops->acquire_exclusive(transport, report->reason,
                                                           sizeof(report->reason));
@@ -581,12 +550,6 @@ cleanup:
         report->image_length = 0U;
     }
 
-#if defined(__APPLE__)
-    if (iousbhost_ctx != NULL) {
-        m65_iousbhost_close(iousbhost_ctx);
-        iousbhost_ctx = NULL;
-    }
-#endif
     return report->code;
 }
 
@@ -596,5 +559,33 @@ void m65_1581_report_destroy(M651581Report *report)
         free(report->image);
         report->image = NULL;
         report->image_length = 0U;
+    }
+}
+
+int m65_diagnose_exit_code(bool transport_created,
+                           M65TransportStatus create_status,
+                           M65ProbeCode inspect_code)
+{
+    if (!transport_created) {
+        /*
+         * The IOUSBHost capture transport could not be created.  A missing
+         * device is a distinct, benign outcome (exit 1); every other creation
+         * failure (permission, timeout, protocol, IO) is a hard error (exit 2).
+         */
+        if (create_status == M65_TRANSPORT_NO_DEVICE) {
+            return 1;
+        }
+        return 2;
+    }
+
+    switch (inspect_code) {
+    case M65_PROBE_OK:
+        return 0;
+    case M65_PROBE_NO_DEVICE:
+        return 1;
+    case M65_PROBE_PERMISSION:
+        return 2;
+    default:
+        return 4;
     }
 }

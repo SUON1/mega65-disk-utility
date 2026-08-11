@@ -50,6 +50,18 @@ typedef struct {
 M65ProbeCode m65_inspect(M65Transport *transport, M65InspectReport *report);
 M65ProbeCode m65_test_1581(M65Transport *transport, bool acknowledgement,
                            M651581Report *report);
+
+/*
+ * Map the outcome of the diagnose workflow to a process exit code.  Kept in
+ * the portable core (linked into m65core) so it is unit-testable without the
+ * macOS transport.  transport_created indicates whether the IOUSBHost capture
+ * transport was successfully created; create_status carries the transport
+ * status when creation failed; inspect_code is the M65ProbeCode returned by
+ * m65_inspect when the transport was created.
+ */
+int m65_diagnose_exit_code(bool transport_created,
+                           M65TransportStatus create_status,
+                           M65ProbeCode inspect_code);
 void m65_1581_report_destroy(M651581Report *report);
 void m65_probe_request_interrupt(void);
 void m65_probe_clear_interrupt(void);
