@@ -275,11 +275,65 @@ void m65_output_list_human(const M65DeviceList *list, const char *error)
     }
 }
 
+/*
+ * Emit the body of the shared "ufi" object for an inspection report: the
+ * INQUIRY identity, TEST UNIT READY state, READ CAPACITY result, the
+ * READ FORMAT CAPACITIES descriptor list, the MODE SENSE flexible-disk page
+ * (with changeable fields), the changeable MODE SENSE page, and the latest
+ * REQUEST SENSE data.  The caller owns the enclosing begin/end object so this
+ * body can be reused by both the inspect and diagnose serializers.
+ */
+static void json_inspect_ufi_body(M65Json *json, const M65InspectReport *report)
+{
+    size_t index;
+    (void)m65_json_key(json, "inquiry");
+    (void)m65_json_begin_object(json);
+    (void)m65_json_key(json, "vendor");
+    (void)m65_json_string(json, report->inquiry.vendor);
+    (void)m65_json_key(json, "product");
+    (void)m65_json_string(json, report->inquiry.product);
+    (void)m65_json_key(json, "firmware");
+    (void)m65_json_string(json, report->inquiry.firmware);
+    (void)m65_json_end_object(json);
+    (void)m65_json_key(json, "test_unit_ready");
+    (void)m65_json_bool(json, report->unit_ready);
+    (void)m65_json_key(json, "capacity");
+    (void)m65_json_begin_object(json);
+    (void)m65_json_key(json, "blocks");
+    (void)m65_json_uint(json, report->capacity.blocks);
+    (void)m65_json_key(json, "block_size");
+    (void)m65_json_uint(json, report->capacity.block_size);
+    (void)m65_json_key(json, "bytes");
+    (void)m65_json_uint(json, (uint64_t)report->capacity.blocks *
+                              (uint64_t)report->capacity.block_size);
+    (void)m65_json_end_object(json);
+    (void)m65_json_key(json, "format_capacities");
+    (void)m65_json_begin_array(json);
+    for (index = 0U; index < report->format_capacities.count; ++index) {
+        const M65FormatCapacityDescriptor *descriptor =
+            &report->format_capacities.descriptors[index];
+        (void)m65_json_begin_object(json);
+        (void)m65_json_key(json, "blocks");
+        (void)m65_json_uint(json, descriptor->blocks);
+        (void)m65_json_key(json, "block_size");
+        (void)m65_json_uint(json, descriptor->block_size);
+        (void)m65_json_key(json, "descriptor_code");
+        (void)m65_json_uint(json, descriptor->descriptor_code);
+        (void)m65_json_end_object(json);
+    }
+    (void)m65_json_end_array(json);
+    (void)m65_json_key(json, "flexible_disk");
+    json_flexible(json, &report->current_mode.flexible, true);
+    (void)m65_json_key(json, "changeable_flexible_disk");
+    json_flexible(json, &report->changeable_mode.flexible, true);
+    (void)m65_json_key(json, "sense");
+    json_sense(json, &report->sense);
+}
+
 bool m65_output_inspect_json(const M65DeviceInfo *device,
                              const M65InspectReport *report)
 {
     M65Json json;
-    size_t index;
     const char *error = report->code == M65_PROBE_OK ? NULL : report->reason;
     if (!json_top(&json, "inspect")) {
         return false;
@@ -294,46 +348,7 @@ bool m65_output_inspect_json(const M65DeviceInfo *device,
     (void)m65_json_end_object(&json);
     (void)m65_json_key(&json, "ufi");
     (void)m65_json_begin_object(&json);
-    (void)m65_json_key(&json, "inquiry");
-    (void)m65_json_begin_object(&json);
-    (void)m65_json_key(&json, "vendor");
-    (void)m65_json_string(&json, report->inquiry.vendor);
-    (void)m65_json_key(&json, "product");
-    (void)m65_json_string(&json, report->inquiry.product);
-    (void)m65_json_key(&json, "firmware");
-    (void)m65_json_string(&json, report->inquiry.firmware);
-    (void)m65_json_end_object(&json);
-    (void)m65_json_key(&json, "test_unit_ready");
-    (void)m65_json_bool(&json, report->unit_ready);
-    (void)m65_json_key(&json, "capacity");
-    (void)m65_json_begin_object(&json);
-    (void)m65_json_key(&json, "blocks");
-    (void)m65_json_uint(&json, report->capacity.blocks);
-    (void)m65_json_key(&json, "block_size");
-    (void)m65_json_uint(&json, report->capacity.block_size);
-    (void)m65_json_key(&json, "bytes");
-    (void)m65_json_uint(&json, (uint64_t)report->capacity.blocks *
-                               (uint64_t)report->capacity.block_size);
-    (void)m65_json_end_object(&json);
-    (void)m65_json_key(&json, "format_capacities");
-    (void)m65_json_begin_array(&json);
-    for (index = 0U; index < report->format_capacities.count; ++index) {
-        const M65FormatCapacityDescriptor *descriptor =
-            &report->format_capacities.descriptors[index];
-        (void)m65_json_begin_object(&json);
-        (void)m65_json_key(&json, "blocks");
-        (void)m65_json_uint(&json, descriptor->blocks);
-        (void)m65_json_key(&json, "block_size");
-        (void)m65_json_uint(&json, descriptor->block_size);
-        (void)m65_json_key(&json, "descriptor_code");
-        (void)m65_json_uint(&json, descriptor->descriptor_code);
-        (void)m65_json_end_object(&json);
-    }
-    (void)m65_json_end_array(&json);
-    (void)m65_json_key(&json, "flexible_disk");
-    json_flexible(&json, &report->current_mode.flexible, true);
-    (void)m65_json_key(&json, "sense");
-    json_sense(&json, &report->sense);
+    json_inspect_ufi_body(&json, report);
     (void)m65_json_end_object(&json);
     (void)m65_json_key(&json, "result");
     (void)m65_json_begin_object(&json);
@@ -481,64 +496,29 @@ void m65_output_1581_human(const M65DeviceInfo *device,
 bool m65_output_diagnose_json(const M65DiagnoseReport *report)
 {
     M65Json json;
+    const M65InspectReport *inspect = &report->inspect;
     const char *error = report->exit_code == 0 ? NULL : report->reason;
-    uint64_t last_lba;
     if (!json_top(&json, "diagnose")) {
         return false;
     }
-    last_lba = report->capacity.blocks > 0U ?
-               (uint64_t)report->capacity.blocks - 1U : 0U;
     (void)m65_json_key(&json, "diagnose");
     (void)m65_json_begin_object(&json);
+    (void)m65_json_key(&json, "transport");
+    (void)m65_json_string(&json, "iousbhost");
     (void)m65_json_key(&json, "vid");
     json_identifier(&json, report->vid);
     (void)m65_json_key(&json, "pid");
     json_identifier(&json, report->pid);
     (void)m65_json_key(&json, "capture");
     (void)m65_json_bool(&json, report->captured);
-    (void)m65_json_key(&json, "alternate_setting_selected");
-    (void)m65_json_bool(&json, report->alt_setting_ok);
-    (void)m65_json_key(&json, "inquiry");
-    (void)m65_json_begin_object(&json);
-    (void)m65_json_key(&json, "ok");
-    (void)m65_json_bool(&json, report->inquiry_ok);
-    (void)m65_json_key(&json, "vendor");
-    (void)m65_json_string(&json, report->inquiry.vendor);
-    (void)m65_json_key(&json, "product");
-    (void)m65_json_string(&json, report->inquiry.product);
-    (void)m65_json_key(&json, "firmware");
-    (void)m65_json_string(&json, report->inquiry.firmware);
-    (void)m65_json_end_object(&json);
-    (void)m65_json_key(&json, "request_sense");
-    (void)m65_json_begin_object(&json);
-    (void)m65_json_key(&json, "ok");
-    (void)m65_json_bool(&json, report->request_sense_ok);
-    (void)m65_json_key(&json, "sense");
-    json_sense(&json, &report->sense);
-    (void)m65_json_end_object(&json);
-    (void)m65_json_key(&json, "read_capacity");
-    (void)m65_json_begin_object(&json);
-    (void)m65_json_key(&json, "ok");
-    (void)m65_json_bool(&json, report->read_capacity_ok);
-    (void)m65_json_key(&json, "last_lba");
-    (void)m65_json_uint(&json, last_lba);
-    (void)m65_json_key(&json, "block_size");
-    (void)m65_json_uint(&json, report->capacity.block_size);
-    (void)m65_json_key(&json, "blocks");
-    (void)m65_json_uint(&json, report->capacity.blocks);
-    (void)m65_json_key(&json, "bytes");
-    (void)m65_json_uint(&json, (uint64_t)report->capacity.blocks *
-                               (uint64_t)report->capacity.block_size);
-    (void)m65_json_end_object(&json);
-    (void)m65_json_key(&json, "mode_sense_flexible");
-    (void)m65_json_begin_object(&json);
-    (void)m65_json_key(&json, "ok");
-    (void)m65_json_bool(&json, report->mode_sense_ok);
-    (void)m65_json_key(&json, "page");
-    json_flexible(&json, &report->flexible, false);
-    (void)m65_json_end_object(&json);
     (void)m65_json_key(&json, "destroy");
     (void)m65_json_bool(&json, report->destroyed);
+    (void)m65_json_key(&json, "ufi");
+    (void)m65_json_begin_object(&json);
+    if (report->captured) {
+        json_inspect_ufi_body(&json, inspect);
+    }
+    (void)m65_json_end_object(&json);
     (void)m65_json_end_object(&json);
     (void)m65_json_key(&json, "result");
     (void)m65_json_begin_object(&json);
@@ -546,8 +526,70 @@ bool m65_output_diagnose_json(const M65DiagnoseReport *report)
     (void)m65_json_string(&json, report->exit_code == 0 ? "ok" : "error");
     (void)m65_json_key(&json, "reason");
     (void)m65_json_string(&json, report->reason);
+    (void)m65_json_key(&json, "exit_code");
+    (void)m65_json_int(&json, report->exit_code);
     (void)m65_json_end_object(&json);
-    json_errors(&json, error, report->sense.valid ? &report->sense : NULL);
+    json_errors(&json, error,
+                inspect->sense.valid ? &inspect->sense : NULL);
     (void)m65_json_end_object(&json);
     return json_emit(&json);
+}
+
+void m65_output_diagnose_human(const M65DiagnoseReport *report)
+{
+    const M65InspectReport *inspect = &report->inspect;
+    size_t index;
+    size_t field;
+    (void)printf("diagnose (IOUSBHost whole-device capture)\n");
+    (void)printf("USB identity: VID 0x%04x, PID 0x%04x\n",
+                 (unsigned int)report->vid, (unsigned int)report->pid);
+    (void)printf("Capture transport created: %s\n",
+                 report->captured ? "yes" : "no");
+    if (report->captured) {
+        (void)printf("INQUIRY: vendor \"%s\", product \"%s\", firmware \"%s\"\n",
+                     inspect->inquiry.vendor, inspect->inquiry.product,
+                     inspect->inquiry.firmware);
+        (void)printf("TEST UNIT READY: %s\n",
+                     inspect->unit_ready ? "ready" : "not ready");
+        (void)printf("READ CAPACITY: %u blocks x %u bytes = %llu bytes\n",
+                     (unsigned int)inspect->capacity.blocks,
+                     (unsigned int)inspect->capacity.block_size,
+                     (unsigned long long)inspect->capacity.blocks *
+                     (unsigned long long)inspect->capacity.block_size);
+        (void)printf("READ FORMAT CAPACITIES:\n");
+        for (index = 0U; index < inspect->format_capacities.count; ++index) {
+            const M65FormatCapacityDescriptor *descriptor =
+                &inspect->format_capacities.descriptors[index];
+            (void)printf("  %u blocks x %u bytes (descriptor code %u)\n",
+                         (unsigned int)descriptor->blocks,
+                         (unsigned int)descriptor->block_size,
+                         (unsigned int)descriptor->descriptor_code);
+        }
+        (void)printf(
+            "MODE SENSE flexible disk: %u kbit/s, %u heads, %u sectors/track, "
+            "%u bytes/sector, %u cylinders, %u RPM\n",
+            (unsigned int)inspect->current_mode.flexible.transfer_rate_kbit,
+            (unsigned int)inspect->current_mode.flexible.heads,
+            (unsigned int)inspect->current_mode.flexible.sectors_per_track,
+            (unsigned int)inspect->current_mode.flexible.bytes_per_sector,
+            (unsigned int)inspect->current_mode.flexible.cylinders,
+            (unsigned int)inspect->current_mode.flexible.medium_rotation_rate_rpm);
+        (void)printf("MODE SENSE changeable fields:");
+        for (field = 0U; field < (size_t)M65_FLEX_FIELD_COUNT; ++field) {
+            if (inspect->changeable_mode.flexible.field_changeable[field]) {
+                (void)printf(" %s",
+                    m65_flexible_field_name((M65FlexibleField)field));
+            }
+        }
+        (void)printf("\n");
+        if (inspect->sense.valid) {
+            (void)printf("REQUEST SENSE: key 0x%02x, ASC 0x%02x, ASCQ 0x%02x\n",
+                         inspect->sense.key, inspect->sense.asc,
+                         inspect->sense.ascq);
+        }
+    }
+    (void)printf("Capture transport destroyed: %s\n",
+                 report->destroyed ? "yes" : "no");
+    (void)printf("Result: %s\n", report->reason);
+    (void)printf("Exit code: %d\n", report->exit_code);
 }
