@@ -15,9 +15,13 @@ static void test_cdbs(void)
     length = m65_cdb_request_sense(cdb, 18U);
     EXPECT_EQ_U64(length, 6U);
     EXPECT_MEMEQ(cdb, ((const uint8_t[16]){0x03U, 0U, 0U, 0U, 18U}), 16U);
-    length = m65_cdb_inquiry(cdb, 96U);
+    length = m65_cdb_inquiry(cdb, M65_UFI_INQUIRY_LENGTH);
     EXPECT_EQ_U64(length, 6U);
-    EXPECT_MEMEQ(cdb, ((const uint8_t[16]){0x12U, 0U, 0U, 0U, 96U}), 16U);
+    EXPECT_MEMEQ(cdb,
+                 ((const uint8_t[16]){
+                     0x12U, 0U, 0U, 0U, M65_UFI_INQUIRY_LENGTH
+                 }),
+                 16U);
     length = m65_cdb_read_capacity_10(cdb);
     EXPECT_EQ_U64(length, 10U);
     EXPECT_MEMEQ(cdb, ((const uint8_t[16]){0x25U}), 16U);
@@ -25,13 +29,13 @@ static void test_cdbs(void)
     EXPECT_EQ_U64(length, 10U);
     EXPECT_MEMEQ(cdb, ((const uint8_t[16]){0x23U, 0U, 0U, 0U, 0U, 0U, 0U,
                                                    0x12U, 0x34U}), 16U);
-    length = m65_cdb_mode_sense_10(cdb, false, 0x0100U);
+    length = m65_cdb_mode_sense_10(cdb, false, M65_UFI_FLEX_MODE_LENGTH);
     EXPECT_EQ_U64(length, 10U);
     EXPECT_MEMEQ(cdb, ((const uint8_t[16]){0x5aU, 0U, 0x05U, 0U, 0U, 0U, 0U,
-                                                   0x01U, 0x00U}), 16U);
-    length = m65_cdb_mode_sense_10(cdb, true, 0x0100U);
-    EXPECT_MEMEQ(cdb, ((const uint8_t[16]){0x5aU, 0U, 0x45U, 0U, 0U, 0U, 0U,
-                                                   0x01U, 0x00U}), 16U);
+                                                   0U, 40U}), 16U);
+    length = m65_cdb_mode_sense_10(cdb, true, M65_UFI_ALL_MODE_LENGTH);
+    EXPECT_MEMEQ(cdb, ((const uint8_t[16]){0x5aU, 0U, 0x7fU, 0U, 0U, 0U, 0U,
+                                                   0U, 72U}), 16U);
     length = m65_cdb_mode_select_10(cdb, 40U);
     EXPECT_EQ_U64(length, 10U);
     EXPECT_MEMEQ(cdb, ((const uint8_t[16]){0x55U, 0x10U, 0U, 0U, 0U, 0U, 0U,
@@ -85,6 +89,17 @@ static void test_formats(void)
 
 static void test_mode_and_sense(void)
 {
+    static const uint8_t malformed_uf000x_changeable[M65_UFI_ALL_MODE_LENGTH] = {
+        0x00U, 0x46U, 0x02U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U,
+        0x4eU, 0x45U, 0x43U, 0x20U, 0x20U, 0x20U, 0x20U, 0x20U,
+        0x55U, 0x53U, 0x42U, 0x20U, 0x55U, 0x46U, 0x30U, 0x30U,
+        0x30U, 0x78U, 0x20U, 0x20U, 0x20U, 0x20U, 0x20U, 0x20U,
+        0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x05U,
+        0x28U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U,
+        0x01U, 0x2cU, 0x00U, 0x00U, 0x1bU, 0x0aU, 0x00U, 0x01U,
+        0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U,
+        0x1cU, 0x06U, 0x00U, 0x05U, 0x00U, 0x00U, 0x00U, 0x00U
+    };
     uint8_t mode[40] = {0U};
     M65ModeParameters parsed;
     M65ModeParameters mask;
@@ -122,6 +137,15 @@ static void test_mode_and_sense(void)
     mode[1] = 50U;
     EXPECT_FALSE(m65_parse_mode_parameters(mode, sizeof(mode), &mask,
                                            detail, sizeof(detail)));
+
+    (void)memset(&mask, 0, sizeof(mask));
+    EXPECT_FALSE(m65_parse_mode_parameters(
+        malformed_uf000x_changeable, sizeof(malformed_uf000x_changeable),
+        &mask, detail, sizeof(detail)));
+    EXPECT_EQ_U64(mask.raw_length, M65_UFI_ALL_MODE_LENGTH);
+    EXPECT_MEMEQ(mask.raw, malformed_uf000x_changeable,
+                 M65_UFI_ALL_MODE_LENGTH);
+    EXPECT_TRUE(strstr(detail, "page header 0x4e at byte 8") != NULL);
 
     EXPECT_TRUE(m65_parse_sense(
         (const uint8_t[]){0x70U, 0U, 0x05U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U,
@@ -176,6 +200,46 @@ static void test_allowlist(void)
     EXPECT_FALSE(m65_validate_command(&command, detail, sizeof(detail)));
     command.data_length = 18U;
     command.direction = M65_DATA_OUT;
+    EXPECT_FALSE(m65_validate_command(&command, detail, sizeof(detail)));
+
+    (void)memset(&command, 0, sizeof(command));
+    command.cdb_length = m65_cdb_inquiry(command.cdb,
+                                         M65_UFI_INQUIRY_LENGTH);
+    command.direction = M65_DATA_IN;
+    command.data = data;
+    command.data_length = M65_UFI_INQUIRY_LENGTH;
+    EXPECT_TRUE(m65_validate_command(&command, detail, sizeof(detail)));
+    command.cdb[4] = 96U;
+    command.data_length = 96U;
+    EXPECT_FALSE(m65_validate_command(&command, detail, sizeof(detail)));
+    command.cdb[4] = M65_UFI_INQUIRY_LENGTH;
+    command.data_length = M65_UFI_INQUIRY_LENGTH;
+    command.cdb[1] = 1U;
+    EXPECT_FALSE(m65_validate_command(&command, detail, sizeof(detail)));
+
+    (void)memset(&command, 0, sizeof(command));
+    command.cdb_length = m65_cdb_mode_sense_10(
+        command.cdb, false, M65_UFI_FLEX_MODE_LENGTH);
+    command.direction = M65_DATA_IN;
+    command.data = data;
+    command.data_length = M65_UFI_FLEX_MODE_LENGTH;
+    EXPECT_TRUE(m65_validate_command(&command, detail, sizeof(detail)));
+    command.cdb[7] = 1U;
+    command.cdb[8] = 0U;
+    command.data_length = 256U;
+    EXPECT_FALSE(m65_validate_command(&command, detail, sizeof(detail)));
+
+    (void)memset(&command, 0, sizeof(command));
+    command.cdb_length = m65_cdb_mode_sense_10(
+        command.cdb, true, M65_UFI_ALL_MODE_LENGTH);
+    command.direction = M65_DATA_IN;
+    command.data = data;
+    command.data_length = M65_UFI_ALL_MODE_LENGTH;
+    EXPECT_TRUE(m65_validate_command(&command, detail, sizeof(detail)));
+    command.cdb[2] = 0x45U;
+    EXPECT_FALSE(m65_validate_command(&command, detail, sizeof(detail)));
+    command.cdb[2] = 0x7fU;
+    command.cdb[1] = 1U;
     EXPECT_FALSE(m65_validate_command(&command, detail, sizeof(detail)));
 }
 

@@ -36,14 +36,26 @@ static void fill_mode_response(uint8_t *data, size_t capacity,
                                const uint8_t page[M65_FLEX_PAGE_LENGTH],
                                M65CommandResult *result)
 {
-    if (capacity < 40U) {
+    size_t page_offset;
+    if (capacity != M65_UFI_FLEX_MODE_LENGTH &&
+        capacity != M65_UFI_ALL_MODE_LENGTH) {
         result->transport_status = M65_TRANSPORT_PROTOCOL;
         return;
     }
     (void)memset(data, 0, capacity);
-    m65_write_be16(data, 38U);
-    (void)memcpy(&data[8], page, M65_FLEX_PAGE_LENGTH);
-    result->transferred = 40U;
+    m65_write_be16(data, (uint16_t)(capacity - 2U));
+    page_offset = 8U;
+    if (capacity == M65_UFI_ALL_MODE_LENGTH) {
+        data[8] = 0x01U;
+        data[9] = 10U;
+        page_offset = 20U;
+        data[52] = 0x1bU;
+        data[53] = 10U;
+        data[64] = 0x1cU;
+        data[65] = 6U;
+    }
+    (void)memcpy(&data[page_offset], page, M65_FLEX_PAGE_LENGTH);
+    result->transferred = capacity;
 }
 
 static void fill_inquiry(uint8_t *data, size_t capacity, M65CommandResult *result)
@@ -137,7 +149,13 @@ static M65CommandResult fake_execute(M65Transport *transport,
     case M65_OPCODE_TEST_UNIT_READY:
         break;
     case M65_OPCODE_INQUIRY:
-        fill_inquiry((uint8_t *)command->data, command->data_length, &result);
+        if (command->data_length != M65_UFI_INQUIRY_LENGTH ||
+            command->cdb[4] != M65_UFI_INQUIRY_LENGTH) {
+            result.transport_status = M65_TRANSPORT_PROTOCOL;
+        } else {
+            fill_inquiry((uint8_t *)command->data, command->data_length,
+                         &result);
+        }
         break;
     case M65_OPCODE_READ_CAPACITY_10:
         fill_capacity((uint8_t *)command->data, command->data_length, &result);

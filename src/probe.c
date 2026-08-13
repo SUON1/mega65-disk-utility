@@ -131,10 +131,10 @@ static bool inspect_input(M65Transport *transport, M65InspectReport *report,
 M65ProbeCode m65_inspect(M65Transport *transport, M65InspectReport *report)
 {
     uint8_t cdb[16];
-    uint8_t inquiry[96];
+    uint8_t inquiry[M65_UFI_INQUIRY_LENGTH];
     uint8_t capacity[8];
     uint8_t formats[252];
-    uint8_t mode[M65_MODE_BUFFER_SIZE];
+    uint8_t mode[M65_UFI_ALL_MODE_LENGTH];
     size_t transferred = 0U;
     char cleanup_detail[M65_MAX_ERROR_TEXT] = "";
     M65TransportStatus acquire_status;
@@ -207,8 +207,9 @@ M65ProbeCode m65_inspect(M65Transport *transport, M65InspectReport *report)
 
     (void)memset(mode, 0, sizeof(mode));
     if (!inspect_input(transport, report, "MODE SENSE current", cdb,
-                       m65_cdb_mode_sense_10(cdb, false, (uint16_t)sizeof(mode)),
-                       mode, sizeof(mode), &transferred) ||
+                       m65_cdb_mode_sense_10(
+                           cdb, false, M65_UFI_FLEX_MODE_LENGTH),
+                       mode, M65_UFI_FLEX_MODE_LENGTH, &transferred) ||
         !m65_parse_mode_parameters(mode, transferred, &report->current_mode,
                                    report->reason, sizeof(report->reason))) {
         if (report->code == M65_PROBE_OK) {
@@ -219,8 +220,9 @@ M65ProbeCode m65_inspect(M65Transport *transport, M65InspectReport *report)
 
     (void)memset(mode, 0, sizeof(mode));
     if (!inspect_input(transport, report, "MODE SENSE changeable", cdb,
-                       m65_cdb_mode_sense_10(cdb, true, (uint16_t)sizeof(mode)),
-                       mode, sizeof(mode), &transferred) ||
+                       m65_cdb_mode_sense_10(
+                           cdb, true, M65_UFI_ALL_MODE_LENGTH),
+                       mode, M65_UFI_ALL_MODE_LENGTH, &transferred) ||
         !m65_parse_mode_parameters(mode, transferred, &report->changeable_mode,
                                    report->reason, sizeof(report->reason)) ||
         !m65_apply_changeability(&report->current_mode.flexible,
@@ -258,14 +260,16 @@ static M65CommandResult mode_sense(M65Transport *transport, bool changeable,
                                    M65ModeParameters *parameters)
 {
     uint8_t cdb[16];
-    uint8_t buffer[M65_MODE_BUFFER_SIZE];
+    uint8_t buffer[M65_UFI_ALL_MODE_LENGTH];
     M65CommandResult result;
+    size_t buffer_length = changeable ? M65_UFI_ALL_MODE_LENGTH :
+                                        M65_UFI_FLEX_MODE_LENGTH;
     char parse_detail[M65_MAX_ERROR_TEXT] = "MODE SENSE response exceeds its buffer";
     (void)memset(buffer, 0, sizeof(buffer));
     result = execute_simple(transport, cdb,
                             m65_cdb_mode_sense_10(cdb, changeable,
-                                                  (uint16_t)sizeof(buffer)),
-                            M65_DATA_IN, buffer, sizeof(buffer));
+                                                  (uint16_t)buffer_length),
+                            M65_DATA_IN, buffer, buffer_length);
     if (command_good(&result)) {
         if (result.transferred > sizeof(buffer) ||
             !m65_parse_mode_parameters(buffer, result.transferred, parameters,

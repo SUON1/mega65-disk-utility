@@ -130,6 +130,25 @@ static void flexible_page_hex(const M65FlexibleDiskPage *page,
     hex[M65_FLEX_PAGE_LENGTH * 2U] = '\0';
 }
 
+static void bytes_hex(const uint8_t *bytes, size_t length, char *hex)
+{
+    static const char digits[] = "0123456789abcdef";
+    size_t index;
+    for (index = 0U; index < length; ++index) {
+        hex[index * 2U] = digits[bytes[index] >> 4U];
+        hex[index * 2U + 1U] = digits[bytes[index] & 0x0fU];
+    }
+    hex[length * 2U] = '\0';
+}
+
+static bool has_valid_flexible_mask(const M65ModeParameters *parameters)
+{
+    return parameters != NULL &&
+           (parameters->flexible.page[0] & 0x40U) == 0U &&
+           (parameters->flexible.page[0] & 0x3fU) == M65_FLEXIBLE_DISK_PAGE &&
+           parameters->flexible.page[1] >= 30U;
+}
+
 static void json_flexible_mask(M65Json *json,
                                const M65FlexibleDiskPage *page)
 {
@@ -310,6 +329,9 @@ void m65_output_list_human(const M65DeviceList *list, const char *error)
  */
 static void json_inspect_ufi_body(M65Json *json, const M65InspectReport *report)
 {
+    char mode_hex[(M65_MODE_BUFFER_SIZE * 2U) + 1U];
+    bool valid_flexible_mask =
+        has_valid_flexible_mask(&report->changeable_mode);
     size_t index;
     (void)m65_json_key(json, "inquiry");
     (void)m65_json_begin_object(json);
@@ -348,9 +370,24 @@ static void json_inspect_ufi_body(M65Json *json, const M65InspectReport *report)
     }
     (void)m65_json_end_array(json);
     (void)m65_json_key(json, "flexible_disk");
-    json_flexible(json, &report->current_mode.flexible, true);
-    (void)m65_json_key(json, "flexible_disk_changeable_mask");
-    json_flexible_mask(json, &report->changeable_mode.flexible);
+    json_flexible(json, &report->current_mode.flexible, valid_flexible_mask);
+    if (report->changeable_mode.raw_length > 0U &&
+        report->changeable_mode.raw_length <= M65_MODE_BUFFER_SIZE) {
+        bytes_hex(report->changeable_mode.raw,
+                  report->changeable_mode.raw_length, mode_hex);
+        (void)m65_json_key(json, "mode_sense_changeable_response");
+        (void)m65_json_begin_object(json);
+        (void)m65_json_key(json, "length");
+        (void)m65_json_uint(json,
+                           (uint64_t)report->changeable_mode.raw_length);
+        (void)m65_json_key(json, "raw_hex");
+        (void)m65_json_string(json, mode_hex);
+        (void)m65_json_end_object(json);
+    }
+    if (valid_flexible_mask) {
+        (void)m65_json_key(json, "flexible_disk_changeable_mask");
+        json_flexible_mask(json, &report->changeable_mode.flexible);
+    }
     (void)m65_json_key(json, "sense");
     json_sense(json, &report->sense);
 }
@@ -399,10 +436,11 @@ bool m65_output_inspect_json(const M65DeviceInfo *device,
 void m65_output_inspect_human(const M65DeviceInfo *device,
                               const M65InspectReport *report)
 {
+    bool valid_flexible_mask =
+        has_valid_flexible_mask(&report->changeable_mode);
     size_t index;
     size_t field;
     char raw_hex[(M65_FLEX_PAGE_LENGTH * 2U) + 1U];
-    flexible_page_hex(&report->changeable_mode.flexible, raw_hex);
     (void)printf("Device: %s\n", device->bsd_name);
     (void)printf("Transport: iousbhost; capture acquired: %s; released: %s\n",
                  report->exclusive_acquired ? "yes" : "no",
@@ -425,8 +463,6 @@ void m65_output_inspect_human(const M65DeviceInfo *device,
                      (unsigned int)descriptor->block_size,
                      (unsigned int)descriptor->descriptor_code);
     }
-    (void)printf("Flexible Disk changeable mask: page 0x%02x, raw %s\n",
-                 report->changeable_mode.flexible.page[0] & 0x3fU, raw_hex);
     (void)printf(
         "Flexible Disk: %u kbit/s, %u heads, %u sectors/track, "
         "%u bytes/sector, %u cylinders, %u RPM\n",
@@ -436,13 +472,23 @@ void m65_output_inspect_human(const M65DeviceInfo *device,
         (unsigned int)report->current_mode.flexible.bytes_per_sector,
         (unsigned int)report->current_mode.flexible.cylinders,
         (unsigned int)report->current_mode.flexible.medium_rotation_rate_rpm);
-    (void)printf("Changeable Flexible Disk fields:");
-    for (field = 0U; field < (size_t)M65_FLEX_FIELD_COUNT; ++field) {
-        if (report->current_mode.flexible.field_changeable[field]) {
-            (void)printf(" %s", m65_flexible_field_name((M65FlexibleField)field));
+    if (valid_flexible_mask) {
+        flexible_page_hex(&report->changeable_mode.flexible, raw_hex);
+        (void)printf("Flexible Disk changeable mask: page 0x%02x, raw %s\n",
+                     report->changeable_mode.flexible.page[0] & 0x3fU,
+                     raw_hex);
+        (void)printf("Changeable Flexible Disk fields:");
+        for (field = 0U; field < (size_t)M65_FLEX_FIELD_COUNT; ++field) {
+            if (report->current_mode.flexible.field_changeable[field]) {
+                (void)printf(" %s",
+                    m65_flexible_field_name((M65FlexibleField)field));
+            }
         }
+        (void)printf("\n");
+    } else {
+        (void)printf("Flexible Disk changeability: unavailable; response rejected\n");
     }
-    (void)printf("\nResult: %s\n", report->reason);
+    (void)printf("Result: %s\n", report->reason);
     if (report->sense.valid) {
         (void)printf("Sense: key 0x%02x, ASC 0x%02x, ASCQ 0x%02x\n",
                      report->sense.key, report->sense.asc, report->sense.ascq);
@@ -601,10 +647,11 @@ bool m65_output_diagnose_json(const M65DiagnoseReport *report)
 void m65_output_diagnose_human(const M65DiagnoseReport *report)
 {
     const M65InspectReport *inspect = &report->inspect;
+    bool valid_flexible_mask =
+        has_valid_flexible_mask(&inspect->changeable_mode);
     size_t index;
     size_t field;
     char raw_hex[(M65_FLEX_PAGE_LENGTH * 2U) + 1U];
-    flexible_page_hex(&inspect->changeable_mode.flexible, raw_hex);
     (void)printf("diagnose (IOUSBHost whole-device capture)\n");
     (void)printf("Device: %s\n", report->device.bsd_name);
     (void)printf("USB identity: VID 0x%04x, PID 0x%04x\n",
@@ -643,17 +690,23 @@ void m65_output_diagnose_human(const M65DiagnoseReport *report)
             (unsigned int)inspect->current_mode.flexible.bytes_per_sector,
             (unsigned int)inspect->current_mode.flexible.cylinders,
             (unsigned int)inspect->current_mode.flexible.medium_rotation_rate_rpm);
-        (void)printf("MODE SENSE changeable fields:");
-        for (field = 0U; field < (size_t)M65_FLEX_FIELD_COUNT; ++field) {
-            if (inspect->current_mode.flexible.field_changeable[field]) {
-                (void)printf(" %s",
-                    m65_flexible_field_name((M65FlexibleField)field));
+        if (valid_flexible_mask) {
+            flexible_page_hex(&inspect->changeable_mode.flexible, raw_hex);
+            (void)printf("MODE SENSE changeable fields:");
+            for (field = 0U; field < (size_t)M65_FLEX_FIELD_COUNT; ++field) {
+                if (inspect->current_mode.flexible.field_changeable[field]) {
+                    (void)printf(" %s",
+                        m65_flexible_field_name((M65FlexibleField)field));
+                }
             }
+            (void)printf("\n");
+            (void)printf("MODE SENSE changeable mask: page 0x%02x, raw %s\n",
+                         inspect->changeable_mode.flexible.page[0] & 0x3fU,
+                         raw_hex);
+        } else {
+            (void)printf(
+                "MODE SENSE changeability: unavailable; response rejected\n");
         }
-        (void)printf("\n");
-        (void)printf("MODE SENSE changeable mask: page 0x%02x, raw %s\n",
-                     inspect->changeable_mode.flexible.page[0] & 0x3fU,
-                     raw_hex);
         if (inspect->sense.valid) {
             (void)printf("REQUEST SENSE: key 0x%02x, ASC 0x%02x, ASCQ 0x%02x\n",
                          inspect->sense.key, inspect->sense.asc,

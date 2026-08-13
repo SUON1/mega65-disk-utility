@@ -96,7 +96,7 @@ size_t m65_cdb_mode_sense_10(uint8_t cdb[16], bool changeable, uint16_t allocati
 {
     cdb_clear(cdb);
     cdb[0] = M65_OPCODE_MODE_SENSE_10;
-    cdb[2] = (uint8_t)(M65_FLEXIBLE_DISK_PAGE | (changeable ? 0x40U : 0x00U));
+    cdb[2] = changeable ? 0x7fU : M65_FLEXIBLE_DISK_PAGE;
     m65_write_be16(&cdb[7], allocation_length);
     return 10U;
 }
@@ -236,7 +236,8 @@ static bool decode_flexible(const uint8_t *page, size_t length,
         return false;
     }
     if ((page[0] & 0x3fU) != M65_FLEXIBLE_DISK_PAGE || (page[0] & 0x40U) != 0U) {
-        set_detail(detail, detail_size, "response does not contain a non-subpage Flexible Disk page");
+        set_detail(detail, detail_size,
+                   "response does not contain a valid UFI Flexible Disk page");
         return false;
     }
     if (page[1] < 30U || (size_t)page[1] + 2U > length) {
@@ -287,7 +288,12 @@ bool m65_parse_mode_parameters(const uint8_t *data, size_t length,
             return false;
         }
         if ((data[offset] & 0x40U) != 0U) {
-            set_detail(detail, detail_size, "MODE SENSE subpages are not accepted for safety");
+            if (detail != NULL && detail_size > 0U) {
+                (void)snprintf(detail, detail_size,
+                               "MODE SENSE UFI page header 0x%02x at byte %zu "
+                               "has reserved bit 6 set",
+                               (unsigned int)data[offset], offset);
+            }
             return false;
         }
         page_length = (size_t)data[offset + 1U] + 2U;
@@ -449,13 +455,46 @@ bool m65_validate_command(const M65Command *command, char *detail, size_t detail
         }
         return true;
     case M65_OPCODE_INQUIRY:
-        return command->cdb_length == 6U &&
-               validate_data(command, M65_DATA_IN, detail, detail_size);
+        if (command->cdb_length != 6U ||
+            !validate_data(command, M65_DATA_IN, detail, detail_size) ||
+            command->cdb[1] != 0U || command->cdb[2] != 0U ||
+            command->cdb[3] != 0U || command->cdb[5] != 0U ||
+            command->cdb[4] != M65_UFI_INQUIRY_LENGTH ||
+            command->data_length != M65_UFI_INQUIRY_LENGTH) {
+            set_detail(detail, detail_size,
+                       "INQUIRY must request the 36-byte standard UFI response");
+            return false;
+        }
+        return true;
     case M65_OPCODE_READ_FORMAT_CAPACITIES:
     case M65_OPCODE_READ_CAPACITY_10:
-    case M65_OPCODE_MODE_SENSE_10:
         return command->cdb_length == 10U &&
                validate_data(command, M65_DATA_IN, detail, detail_size);
+    case M65_OPCODE_MODE_SENSE_10:
+        if (command->cdb_length != 10U ||
+            !validate_data(command, M65_DATA_IN, detail, detail_size) ||
+            command->cdb[1] != 0U || command->cdb[3] != 0U ||
+            command->cdb[4] != 0U || command->cdb[5] != 0U ||
+            command->cdb[6] != 0U || command->cdb[9] != 0U ||
+            !m65_read_be16(command->cdb, command->cdb_length, 7U,
+                           &encoded_length)) {
+            set_detail(detail, detail_size,
+                       "MODE SENSE (10) reserved fields are invalid");
+            return false;
+        }
+        if (command->cdb[2] == M65_FLEXIBLE_DISK_PAGE &&
+            encoded_length == M65_UFI_FLEX_MODE_LENGTH &&
+            command->data_length == M65_UFI_FLEX_MODE_LENGTH) {
+            return true;
+        }
+        if (command->cdb[2] == 0x7fU &&
+            encoded_length == M65_UFI_ALL_MODE_LENGTH &&
+            command->data_length == M65_UFI_ALL_MODE_LENGTH) {
+            return true;
+        }
+        set_detail(detail, detail_size,
+                   "MODE SENSE (10) page and allocation length are invalid");
+        return false;
     case M65_OPCODE_READ_10:
         if (command->cdb_length != 10U ||
             !validate_data(command, M65_DATA_IN, detail, detail_size) ||

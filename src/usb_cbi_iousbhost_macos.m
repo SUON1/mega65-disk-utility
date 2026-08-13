@@ -15,9 +15,10 @@
  *     is located up front by walking the IORegistry ancestry (identical
  *     identity test to the IOUSBLib transport in usb_cbi_macos.c: interface
  *     class 0x08 / subclass 0x04 / protocol 0x00 AND VID 0x0644 / PID 0x0000).
- *     Capture (initWithIOService:options:DeviceCapture:...) binds to THAT exact
- *     io_service_t, so the captured device is provably the same one selected by
- *     --device.
+ *     The interface's parent IOUSBHostDevice is captured first, then THAT exact
+ *     correlated interface is opened without capture options.  Holding both
+ *     objects keeps whole-device ownership and pipe access tied to the device
+ *     selected by --device.
  *   - Descriptor parsing is self-contained (local packed structs) so the build
  *     never depends on SDK descriptor-type macros such as kUSBEndpointDesc.
  *   - The class-specific ADSC control request fills IOUSBDeviceRequest fields
@@ -112,6 +113,7 @@ typedef struct {
 /* Strong ObjC references are held by this class; ARC forbids strong pointers in
  * a plain C struct, so the context keeps it behind a bridged void*. */
 @interface M65IOUSBHostAdapter : NSObject
+@property (nonatomic, strong) IOUSBHostDevice *capturedDevice;
 @property (nonatomic, strong) IOUSBHostInterface *iface;
 @property (nonatomic, strong) IOUSBHostPipe *pipeIn;   /* bulk-IN */
 @property (nonatomic, strong) IOUSBHostPipe *pipeOut;  /* bulk-OUT */
@@ -123,7 +125,8 @@ typedef struct {
 @end
 
 typedef struct {
-    io_service_t service;   /* retained until destroy */
+    io_service_t device_service;    /* retained until destroy */
+    io_service_t interface_service; /* retained until destroy */
     void *adapter;          /* __bridge_retained M65IOUSBHostAdapter* while open */
     uint8_t interface_number;
     bool open;
@@ -165,12 +168,21 @@ static void append_io_return(char *detail, size_t detail_size,
     }
 }
 
+/* IOUSBHost.framework reports endpoint STALL in the USBHost error group,
+ * while the legacy IOUSBLib path reports kIOUSBPipeStalled.  They are
+ * distinct official IOReturn values and both must drive CBI stall recovery. */
+static bool is_pipe_stall(IOReturn result)
+{
+    return result == kUSBHostReturnPipeStalled ||
+           result == kIOUSBPipeStalled;
+}
+
 static M65CbiIoStatus map_io_return(IOReturn result)
 {
     if (result == kIOReturnSuccess) {
         return M65_CBI_IO_OK;
     }
-    if (result == kIOUSBPipeStalled) {
+    if (is_pipe_stall(result)) {
         return M65_CBI_IO_STALL;
     }
     if (result == kIOReturnNotPrivileged || result == kIOReturnNotPermitted ||
@@ -229,7 +241,8 @@ static bool is_known_ufi_cbi_interface(io_registry_entry_t service)
     uint16_t interface_protocol = 0U;
     uint16_t vendor = 0U;
     uint16_t product = 0U;
-    return cf_number_u16(service, CFSTR("bInterfaceClass"), &interface_class) &&
+    return IOObjectConformsTo(service, "IOUSBHostInterface") != 0 &&
+           cf_number_u16(service, CFSTR("bInterfaceClass"), &interface_class) &&
            cf_number_u16(service, CFSTR("bInterfaceSubClass"), &interface_subclass) &&
            cf_number_u16(service, CFSTR("bInterfaceProtocol"), &interface_protocol) &&
            cf_number_u16(service, CFSTR("idVendor"), &vendor) &&
@@ -237,6 +250,16 @@ static bool is_known_ufi_cbi_interface(io_registry_entry_t service)
            interface_class == M65_USB_MASS_STORAGE_CLASS &&
            interface_subclass == M65_USB_UFI_SUBCLASS &&
            interface_protocol == M65_USB_CBI_PROTOCOL &&
+           vendor == M65_USB_TEAC_VID && product == M65_USB_TEAC_PID;
+}
+
+static bool is_known_teac_device(io_registry_entry_t service)
+{
+    uint16_t vendor = 0U;
+    uint16_t product = 0U;
+    return IOObjectConformsTo(service, "IOUSBHostDevice") != 0 &&
+           cf_number_u16(service, CFSTR("idVendor"), &vendor) &&
+           cf_number_u16(service, CFSTR("idProduct"), &product) &&
            vendor == M65_USB_TEAC_VID && product == M65_USB_TEAC_PID;
 }
 
@@ -264,6 +287,28 @@ static io_service_t copy_usb_interface_for_bsd_name(const char *bsd_name)
     while (current != IO_OBJECT_NULL) {
         io_registry_entry_t parent = IO_OBJECT_NULL;
         if (is_known_ufi_cbi_interface(current)) {
+            return current;
+        }
+        if (IORegistryEntryGetParentEntry(current, kIOServicePlane, &parent) !=
+            KERN_SUCCESS) {
+            parent = IO_OBJECT_NULL;
+        }
+        IOObjectRelease(current);
+        current = parent;
+    }
+    return IO_OBJECT_NULL;
+}
+
+static io_service_t copy_parent_usb_device(io_service_t interface_service)
+{
+    io_registry_entry_t current = IO_OBJECT_NULL;
+    if (IORegistryEntryGetParentEntry(interface_service, kIOServicePlane,
+                                      &current) != KERN_SUCCESS) {
+        return IO_OBJECT_NULL;
+    }
+    while (current != IO_OBJECT_NULL) {
+        io_registry_entry_t parent = IO_OBJECT_NULL;
+        if (is_known_teac_device(current)) {
             return current;
         }
         if (IORegistryEntryGetParentEntry(current, kIOServicePlane, &parent) !=
@@ -515,6 +560,7 @@ static M65CbiIoStatus iousbhost_open_seize(M65CbiIo *io,
     IousbhostContext *context = (IousbhostContext *)io->context;
     M65IOUSBHostAdapter *adapter;
     NSError *error = nil;
+    IOUSBHostDevice *device;
     IOUSBHostInterface *iface;
     uint8_t bulk_in = 0U;
     uint8_t bulk_out = 0U;
@@ -528,16 +574,35 @@ static M65CbiIoStatus iousbhost_open_seize(M65CbiIo *io,
         return M65_CBI_IO_OK;
     }
 
-    iface = [[IOUSBHostInterface alloc]
-        initWithIOService:context->service
+    /* DeviceCapture is a whole-device option.  Apple documents it against an
+     * IOUSBHostDevice and specifies that destroying that device object resets
+     * the device and re-registers its interface drivers. */
+    device = [[IOUSBHostDevice alloc]
+        initWithIOService:context->device_service
                   options:IOUSBHostObjectInitOptionsDeviceCapture
+                    queue:nil
+                    error:&error
+          interestHandler:nil];
+    if (device == nil) {
+        IOReturn code = io_return_from_error(error);
+        describe_io_return(detail, detail_size,
+                           "IOUSBHostDevice DeviceCapture (initWithIOService)",
+                           code);
+        return map_io_return(code);
+    }
+
+    error = nil;
+    iface = [[IOUSBHostInterface alloc]
+        initWithIOService:context->interface_service
+                  options:IOUSBHostObjectInitOptionsNone
                     queue:nil
                     error:&error
           interestHandler:nil];
     if (iface == nil) {
         IOReturn code = io_return_from_error(error);
         describe_io_return(detail, detail_size,
-                           "IOUSBHost DeviceCapture (initWithIOService)", code);
+                           "open captured IOUSBHostInterface", code);
+        [device destroy];
         return map_io_return(code);
     }
 
@@ -547,14 +612,17 @@ static M65CbiIoStatus iousbhost_open_seize(M65CbiIo *io,
         describe_io_return(detail, detail_size,
                            "IOUSBHost selectAlternateSetting:0", code);
         [iface destroy];
+        [device destroy];
         return map_io_return(code);
     }
 
     adapter = [[M65IOUSBHostAdapter alloc] init];
+    adapter.capturedDevice = device;
     adapter.iface = iface;
     if (!discover_endpoints(adapter, &bulk_in, &bulk_out, &intr_in,
                             detail, detail_size)) {
         [iface destroy];
+        [device destroy];
         return M65_CBI_IO_PROTOCOL;
     }
 
@@ -565,6 +633,7 @@ static M65CbiIoStatus iousbhost_open_seize(M65CbiIo *io,
         describe_io_return(detail, detail_size,
                            "IOUSBHost copyPipeWithAddress (bulk-OUT)", code);
         [iface destroy];
+        [device destroy];
         return map_io_return(code);
     }
     error = nil;
@@ -574,6 +643,7 @@ static M65CbiIoStatus iousbhost_open_seize(M65CbiIo *io,
         describe_io_return(detail, detail_size,
                            "IOUSBHost copyPipeWithAddress (bulk-IN)", code);
         [iface destroy];
+        [device destroy];
         return map_io_return(code);
     }
     error = nil;
@@ -583,6 +653,7 @@ static M65CbiIoStatus iousbhost_open_seize(M65CbiIo *io,
         describe_io_return(detail, detail_size,
                            "IOUSBHost copyPipeWithAddress (interrupt-IN)", code);
         [iface destroy];
+        [device destroy];
         return map_io_return(code);
     }
 
@@ -617,12 +688,16 @@ static M65CbiIoStatus iousbhost_close(M65CbiIo *io,
     if (adapter != nil) {
         abort_status = abort_and_drain_interrupt(adapter, &completion_result,
                                                  detail, detail_size);
-        [adapter.iface destroy]; /* resets device; kernel re-registers driver */
         adapter.pendingInterrupt = nil;
         adapter.pipeIn = nil;
         adapter.pipeOut = nil;
         adapter.pipeIntr = nil;
+        [adapter.iface destroy];
         adapter.iface = nil;
+        /* Destroy the capture owner last.  This resets the whole device and
+         * causes macOS to re-register its interface drivers for matching. */
+        [adapter.capturedDevice destroy];
+        adapter.capturedDevice = nil;
     }
     (void)completion_result;
     return abort_status;
@@ -714,7 +789,7 @@ static M65CbiIoStatus iousbhost_bulk_in(M65CbiIo *io, void *data, size_t length,
     if (!ok) {
         IOReturn code = io_return_from_error(error);
         describe_io_return(detail, detail_size, "CBI bulk-IN", code);
-        if (code != kIOUSBPipeStalled) {
+        if (!is_pipe_stall(code)) {
             context->desynchronized = true;
         }
         return map_io_return(code);
@@ -751,7 +826,7 @@ static M65CbiIoStatus iousbhost_bulk_out(M65CbiIo *io, const void *data,
     if (!ok) {
         IOReturn code = io_return_from_error(error);
         describe_io_return(detail, detail_size, "CBI bulk-OUT", code);
-        if (code != kIOUSBPipeStalled) {
+        if (!is_pipe_stall(code)) {
             context->desynchronized = true;
         }
         return map_io_return(code);
@@ -960,9 +1035,13 @@ static void iousbhost_destroy_io(M65CbiIo *io)
              * releases the strong local at the end of this scope. */
             (void)adapter;
         }
-        if (context->service != IO_OBJECT_NULL) {
-            IOObjectRelease(context->service);
-            context->service = IO_OBJECT_NULL;
+        if (context->interface_service != IO_OBJECT_NULL) {
+            IOObjectRelease(context->interface_service);
+            context->interface_service = IO_OBJECT_NULL;
+        }
+        if (context->device_service != IO_OBJECT_NULL) {
+            IOObjectRelease(context->device_service);
+            context->device_service = IO_OBJECT_NULL;
         }
         free(context);
     }
@@ -987,7 +1066,8 @@ M65Transport *m65_iousbhost_transport_create(const char *bsd_name,
                                              M65TransportStatus *status)
 {
     const char *name = normalize_name(bsd_name);
-    io_service_t service;
+    io_service_t interface_service;
+    io_service_t device_service;
     M65CbiIo *io;
     IousbhostContext *context;
     M65Transport *transport;
@@ -999,13 +1079,23 @@ M65Transport *m65_iousbhost_transport_create(const char *bsd_name,
         set_detail(detail, detail_size, "missing BSD device name");
         return NULL;
     }
-    service = copy_usb_interface_for_bsd_name(name);
-    if (service == IO_OBJECT_NULL) {
+    interface_service = copy_usb_interface_for_bsd_name(name);
+    if (interface_service == IO_OBJECT_NULL) {
         if (status != NULL) {
             *status = M65_TRANSPORT_NO_DEVICE;
         }
         set_detail(detail, detail_size,
                    "selected media has no matching TEAC USB UFI/CBI interface for IOUSBHost capture");
+        return NULL;
+    }
+    device_service = copy_parent_usb_device(interface_service);
+    if (device_service == IO_OBJECT_NULL) {
+        IOObjectRelease(interface_service);
+        if (status != NULL) {
+            *status = M65_TRANSPORT_NO_DEVICE;
+        }
+        set_detail(detail, detail_size,
+                   "selected UFI/CBI interface has no matching parent IOUSBHostDevice");
         return NULL;
     }
 
@@ -1014,12 +1104,14 @@ M65Transport *m65_iousbhost_transport_create(const char *bsd_name,
     if (io == NULL || context == NULL) {
         free(io);
         free(context);
-        IOObjectRelease(service);
+        IOObjectRelease(interface_service);
+        IOObjectRelease(device_service);
         set_detail(detail, detail_size,
                    "out of memory creating IOUSBHost CBI transport");
         return NULL;
     }
-    context->service = service; /* retained; released in iousbhost_destroy_io */
+    context->interface_service = interface_service;
+    context->device_service = device_service;
     io->ops = &iousbhost_cbi_ops;
     io->context = context;
     transport = m65_cbi_transport_create(io);

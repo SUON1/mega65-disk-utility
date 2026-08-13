@@ -151,6 +151,37 @@ static void test_inspect_serializer(void)
     free(output);
 }
 
+static void test_inspect_failed_changeable_response(void)
+{
+    M65DeviceInfo device = sample_device();
+    M65InspectReport report = sample_inspect_report();
+    InspectContext context = {&device, &report};
+    char *output;
+    report.code = M65_PROBE_TRANSPORT;
+    (void)snprintf(report.reason, sizeof(report.reason),
+                   "MODE SENSE UFI page header 0x4e at byte 8 has reserved bit 6 set");
+    (void)memset(&report.changeable_mode, 0,
+                 sizeof(report.changeable_mode));
+    report.changeable_mode.raw_length = M65_UFI_ALL_MODE_LENGTH;
+    report.changeable_mode.raw[0] = 0U;
+    report.changeable_mode.raw[1] = 70U;
+    report.changeable_mode.raw[8] = 0x41U;
+    report.changeable_mode.raw[9] = 10U;
+
+    output = capture_output(write_inspect, &context);
+    EXPECT_TRUE(output != NULL);
+    if (output == NULL) {
+        return;
+    }
+    EXPECT_TRUE(strstr(output,
+                       "\"mode_sense_changeable_response\":{\"length\":72") != NULL);
+    EXPECT_TRUE(strstr(output, "\"raw_hex\":\"0046") != NULL);
+    EXPECT_TRUE(strstr(output,
+                       "\"flexible_disk_changeable_mask\"") == NULL);
+    EXPECT_TRUE(strstr(output, "\"changeable_fields\"") == NULL);
+    free(output);
+}
+
 static void test_diagnose_capture_failure(void)
 {
     M65DiagnoseReport report;
@@ -213,6 +244,7 @@ static void test_1581_transport_state(void)
 void test_output(void)
 {
     test_inspect_serializer();
+    test_inspect_failed_changeable_response();
     test_diagnose_capture_failure();
     test_1581_transport_state();
 }
